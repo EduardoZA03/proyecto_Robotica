@@ -1,0 +1,15 @@
+# Clave del WiFi: NUNCA subir (usar secretos.ejemplo.h como plantilla)
+secretos.h
+
+# Fotos de personas y datasets pesados (se regeneran con los scripts)
+dataset/esp32cam/
+dataset/rostros/
+dataset/rostros_extra/
+dataset/_cache/
+
+# Respaldos y carpetas de compilación
+respaldo_modelos/
+_b7/
+build/
+*.elf
+*.bin

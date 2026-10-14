@@ -3,10 +3,14 @@
  * ------------------------------------------------------------
  * La ESP32-CAM se conecta al WiFi y publica su imagen:
  *   http://<IP>/       -> página con la imagen en vivo
- *   http://<IP>/foto   -> una foto JPEG 320x240 (la misma resolución
- *                         que usa el seguimiento de rostros)
+ *   http://<IP>/foto   -> una foto JPEG 640x480 (la misma resolución
+ *                         que usa 07_vigia_completo)
  * El script captura_fotos.ps1 (en la carpeta dataset) descarga las
  * fotos automáticamente a la PC. No hace falta la microSD.
+ *
+ * (14 oct) Se cambió de 320x240 a 640x480 para que las fotos sean iguales
+ * a las del 07. Así sirven para dataset\analizar_firmas.py (mide la firma
+ * de color con la misma imagen que ve el ESP32) y para Edge Impulse.
  *
  * ANTES DE SUBIR: escribir el nombre y la clave del WiFi en la pestaña
  * "secretos.h" (Arduino IDE la muestra como pestaña junto a este archivo)
@@ -66,7 +70,7 @@ bool iniciarCamara() {
   config.pin_reset = RESET_GPIO_NUM;
   config.xclk_freq_hz = 10000000;
   config.pixel_format = PIXFORMAT_JPEG;
-  config.frame_size   = FRAMESIZE_QVGA;    // 320x240, igual que el seguimiento
+  config.frame_size   = FRAMESIZE_VGA;     // 640x480, igual que 07_vigia_completo
   config.jpeg_quality = 10;                // algo mejor calidad para el dataset
   config.fb_count     = 2;
   config.fb_location  = CAMERA_FB_IN_PSRAM;

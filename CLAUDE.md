@@ -19,7 +19,11 @@ Cesar Augusto Reyes Gutierrez). Una **ESP32-CAM** en un soporte **pan-tilt**
 (2 servos MG996R) que **recorre el lugar buscando rostros nuevos**, les toma
 **1 foto** y los **ignora durante 5 minutos** mientras sigue buscando a otros.
 Pasados 5 min, la misma persona puede volver a ser fotografiada.
-NO sigue a las personas. NO identifica a nadie (privacidad por diseño).
+NO sigue a las personas.
+**Cambio del 14 oct (decisión del usuario: priorizar que funcione bien sobre la
+privacidad)**: la decisión "¿nueva o conocida?" la toma la **PC con reconocimiento
+facial** (ver "Reconocimiento en la PC"). El informe ya NO puede decir "no
+identifica a nadie / sin biometría": hay que reescribir esa parte.
 
 ## Hardware y conexiones
 | Parte | Detalle |
@@ -50,6 +54,14 @@ NO sigue a las personas. NO identifica a nadie (privacidad por diseño).
 - Librería del modelo: `Documentos\Arduino\libraries\MUCKCITO-project-1_inferencing` (modelo 1.0.2).
 - Compilar el ESP32 con la librería de IA tarda **~15 min** (siempre la recompila).
 - En PowerShell usar `& $cli ... 2>&1 | Out-String` (`cmd /c` dentro de scripts largos fue bloqueado).
+- **Segunda PC (usuario "Usuario", 14 oct)**: arduino-cli en
+  `C:\Users\Usuario\AppData\Local\Programs\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe`
+  (cores esp32 3.3.12 y avr OK). **Falta** la librería `MUCKCITO-project-1_inferencing`
+  (no compila 05 ni 07 hasta copiarla). El proyecto está en el Escritorio (redirigido a
+  OneDrive "Trabajos de comunicación 3"), **dentro de una carpeta doble**:
+  `proyecto_Robotica-main\proyecto_Robotica-main\` (así se descomprimió el ZIP).
+  El repo de GitHub (EduardoZA03/proyecto_Robotica) es privado.
+- Python 3.13 con `opencv-python<5` (OpenCV 5 ya no trae el detector Haar), numpy, matplotlib.
 
 ## Programas (carpetas)
 | Carpeta | Qué hace | Estado |
@@ -59,9 +71,9 @@ NO sigue a las personas. NO identifica a nadie (privacidad por diseño).
 | **03_arduino_servos** | Uno: recibe "P.. T..", movimiento suave, modo demo (D) | **En uso** |
 | 04_enlace_esp_arduino | Prueba del enlace ESP32→Uno | OK |
 | 05_seguimiento_rostros | Seguimiento de rostros (sin fotos) | OK (versión estable) |
-| 06_captura_dataset | Vista por WiFi + captura de fotos para entrenar | OK |
+| 06_captura_dataset | Vista por WiFi + captura de fotos (**640x480 desde el 14 oct**, igual que el 07) | Compila; falta subirlo |
 | **07_vigia_completo** | Sistema completo: buscar, fotografiar, ignorar, galería web | Ver "Estado actual" |
-| dataset/ | Scripts de descarga (Open Images) y captura | Imágenes NO van a GitHub |
+| dataset/ | Scripts de descarga (Open Images), captura y `analizar_firmas.py` | Imágenes NO van a GitHub |
 
 ## Valores calibrados (no cambiar sin probar)
 - **Uno**: pan centro 110 (50–160), tilt centro 70 (10–120); VEL_MAX 50 °/s, ACEL 60 °/s².
@@ -98,6 +110,29 @@ NO sigue a las personas. NO identifica a nadie (privacidad por diseño).
 14. El usuario una vez pegó otro código encima de un .ino en Arduino IDE: pedirle que
     no edite los archivos ahí.
 
+## Reconocimiento en la PC (14 oct) — `pc_servidor\servidor_vigia.py`
+- Flujo: el 07 centra el rostro → `POST http://PC_IP:8000/rostro` con el JPEG 640x480 →
+  la PC responde texto: `NUEVA <persona> <foto>` | `CONOCIDA <persona> <segundos>` | `SIN_ROSTRO`.
+- PC: **YuNet** (rostro + 5 puntos: ojos, nariz, boca) → `alignCrop` → **SFace** (huella
+  de 128 números) → similitud coseno, umbral **0.363**, hasta 6 vistas por persona.
+  Ventana 5 min; pasada la ventana, otra foto con el MISMO número de persona.
+- La PC guarda las fotos en `pc_servidor\fotos\` (+ `registro.csv`) y tiene galería en
+  `http://<IP PC>:8000/`. `--probar a.jpg b.jpg` analiza fotos sin ESP32.
+- Probado con fotos de OpenCV (Lena/Messi/mandril): misma persona 0.66–0.97, distinta
+  0.19–0.28, mandril = SIN_ROSTRO. ~40–100 ms por foto en la PC.
+- ESP32: `PC_IP` en secretos.h (si falta, `#define PC_IP ""` → modo antiguo). La firma
+  de color se sigue guardando con el número de la PC para **ignorar de lejos**
+  (UMBRAL_IGNORAR) sin preguntar. `SIN_ROSTRO` → se guarda como "persona" 0 (ignorar 5 min
+  falsos positivos de FOMO). Si la PC falla → firma de color + flash (respaldo), y no
+  vuelve a probar la PC por 30 s.
+- **OpenCV no abre archivos con tildes en la ruta** ("comunicación"): los modelos se
+  cargan desde memoria (`np.fromfile` + `create("onnx", buffer, ...)`); fotos con
+  `imdecode`/`tofile`.
+- **Firewall de Windows**: la 1.ª vez hay que permitir Python en redes privadas.
+- Compila (14 oct) con una **librería de Edge Impulse simulada** en `C:\vigia_c06\libs`
+  (solo para revisar errores; NO subir ese binario). Con la librería real hay que
+  compilar de nuevo. En esta PC LittleFS compiló bien.
+
 ## Re-identificación de personas (límite conocido)
 - Se usa una **firma de color de la cabeza** (no de la ropa: en el laboratorio todos
   usan **bata blanca**): 3 franjas (pelo/frente, ojos/nariz, boca/mentón) con
@@ -109,6 +144,14 @@ NO sigue a las personas. NO identifica a nadie (privacidad por diseño).
 - **Opción B pendiente** (para el proyecto final): plantilla del rostro en grises con
   búsqueda de desplazamiento. Distingue mejor, pero se acerca a reconocimiento facial:
   habría que ajustar la frase "sin identificación biométrica" del informe.
+- **Herramienta de medición (14 oct)**: `dataset\analizar_firmas.py`. Lee fotos de
+  `dataset\muestra\personaN\*.jpg` (tomadas con el 06 + `captura_fotos.ps1 -Carpeta muestra\personaN`),
+  detecta el rostro con Haar, calcula la firma **idéntica** a `calcularFirma()` (verificado
+  contra una copia literal del C) y una variante **escalada al tamaño del rostro** (la actual
+  usa franjas fijas en píxeles: de lejos mezcla fondo). Muestra % de fotos repetidas / personas
+  perdidas por umbral, recomienda umbral, `--revisar` dibuja franjas, `--grafico` hace PNG.
+  Decisión del 14 oct: **NO entrenar la IA en Python** (Edge Impulse da lo mismo); Python solo
+  para medir y ajustar. Muestra: nombres genéricos, con permiso, borrar fotos al terminar.
 
 ## Estado actual (14 oct 2026)
 - **Cargado en el ESP32**: versión 07 con fotos en PSRAM, WiFi a 8.5 dBm y opción A.
@@ -130,3 +173,13 @@ NO sigue a las personas. NO identifica a nadie (privacidad por diseño).
 5. Opción B de re-identificación (decidir con el grupo por el tema de privacidad).
 6. Informe: ajustar objetivo SMART de latencia (150 ms → valor medido ~700 ms) y
    mencionar ESP32-S3 como mejora futura.
+9. **Probar el reconocimiento en la PC con el ESP32 real**: copiar la librería de
+   Edge Impulse a esta PC (o compilar en la otra), poner `PC_IP` en secretos.h,
+   compilar y subir el 07, correr `python servidor_vigia.py` y probar con el grupo.
+   Ajustar `UMBRAL_COSENO` si confunde (subir) o repite (bajar).
+10. Reescribir en el informe la parte de privacidad ("sin biometría").
+7. (Menos prioritario ahora que hay reconocimiento en la PC) Subir el 06 (640x480), tomar la muestra (8–10 personas, 10–20 fotos c/u, en el
+   laboratorio con bata) y correr `analizar_firmas.py`; con los números, ajustar
+   `UMBRAL_MISMA`/`UMBRAL_IGNORAR` y decidir si se pasa a la firma escalada en el 07.
+8. Revisar en Edge Impulse si el modelo se exportó **cuantizado (int8) + EON**; si no,
+   podría bajar la latencia. Reentrenar con fotos de la ESP32-CAM para detectar mejor.

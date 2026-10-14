@@ -15,6 +15,13 @@
  *  3. GALERÍA por WiFi: http://<IP>/ muestra las fotos con fecha y hora
  *     (se guardan en la memoria FLASH, máximo MAX_FOTOS, y NO se pierden al
  *     reiniciar o apagar; la microSD no funciona).
+ *  4. (14 oct) RECONOCIMIENTO FACIAL EN LA PC: si en secretos.h está PC_IP y
+ *     la PC corre pc_servidor\servidor_vigia.py, al centrar un rostro se le
+ *     envía la foto a la PC, que decide con reconocimiento facial real
+ *     (YuNet + SFace: ojos, nariz y boca) si es NUEVA o CONOCIDA. La PC guarda
+ *     la foto y la muestra en su galería http://<IP de la PC>:8000/
+ *     Si la PC no responde, se usa la firma de color de siempre (respaldo) y
+ *     la foto va a la flash del ESP32.
  *
  * Conexiones (modo USO):
  *   ESP32 IO13 -> Arduino pin 2     ESP32 GND -> GND común
@@ -22,12 +29,21 @@
  *
  * Requiere:
  *   - Librería de Edge Impulse MUCKCITO-project-1_inferencing
- *   - secretos.h con el WiFi (pestaña junto a este archivo)
+ *   - secretos.h con el WiFi (pestaña junto a este archivo) y, para usar la
+ *     PC, la línea:  #define PC_IP "192.168.18.50"  (la IP que muestra el
+ *     servidor al arrancar)
  *
  * Mensajes en el Monitor Serie del Arduino (9600):
  *   [ESP32 info] rostros 1 | IA 700 | x48 y50 c95   -> seguimiento
- *   [ESP32 info] FOTO #3 persona 2 (nueva)            -> foto guardada
+ *   [ESP32 info] FOTO #3 persona 2 (PC)               -> la PC guardó la foto
  *   [ESP32 info] persona 2 ya registrada (hace 40s)   -> no repite
+ *   [ESP32 info] no era un rostro (dice la PC)        -> FOMO se equivocó
+ *   [ESP32 info] PC no responde: uso la firma de color -> modo respaldo
+ *
+ * Errores comunes (PC):
+ *   "PC no responde" -> servidor apagado, otra red WiFi, IP de la PC cambió
+ *       (actualizar PC_IP y volver a subir) o el firewall de Windows bloquea
+ *       Python (permitirlo en "Redes privadas").
  */
 
 #include <MUCKCITO-project-1_inferencing.h>
@@ -36,12 +52,30 @@
 #include "img_converters.h"
 #include <WiFi.h>
 #include <WebServer.h>
+#include <HTTPClient.h>
 #include <time.h>
 #include <LittleFS.h>
 #include <Preferences.h>
 #include "soc/soc.h"
 #include "soc/rtc_cntl_reg.h"
 #include "secretos.h"
+
+// ---- Reconocimiento facial en la PC (pc_servidor\servidor_vigia.py) ----
+// La IP se pone en secretos.h:  #define PC_IP "192.168.18.50"
+// Si no está (secretos.h viejo), funciona como antes, solo con la firma de color.
+#ifndef PC_IP
+#define PC_IP ""
+#endif
+#define PC_PUERTO        8000
+#define PC_TIMEOUT_MS    4000    // espera máxima de la respuesta de la PC
+#define PC_REINTENTO_MS  30000   // si la PC falló, no volver a probar hasta 30 s después
+// Respuestas de la PC (con #define y no enum: el preprocesador del .ino
+// pone los prototipos antes del enum y no compila)
+#define PC_FALLA      0
+#define PC_NUEVA      1
+#define PC_CONOCIDA   2
+#define PC_SIN_ROSTRO 3
+#define ID_SIN_ROSTRO 0          // "persona" 0 = algo que FOMO creyó rostro y no lo es
 
 // ---- Pines de la cámara (AI-Thinker) ----
 #define PWDN_GPIO_NUM     32
@@ -375,7 +409,9 @@ int buscarPersona(const float *firma, float umbral, float *simMax) {
   return (mejorSim >= umbral) ? mejor : -1;
 }
 
-int nuevaPersona(const float *firma) {
+// Registra una persona con el número 'id' (lo da la PC, o siguienteIdPersona
+// en modo respaldo). Devuelve su índice en personas[].
+int nuevaPersona(const float *firma, int id) {
   int libre = -1;
   unsigned long masVieja = 0;
   for (int i = 0; i < MAX_PERSONAS; i++) {
@@ -385,10 +421,18 @@ int nuevaPersona(const float *firma) {
   }
   Persona &p = personas[libre];
   p.activa = true;
-  p.id = siguienteIdPersona++;
+  p.id = id;
+  if (id >= siguienteIdPersona) siguienteIdPersona = id + 1;  // no repetir números de la PC
   memcpy(p.firma, firma, sizeof(p.firma));
   p.ultimaFoto = millis();
   return libre;
+}
+
+// Índice de la persona con ese número (o -1)
+int buscarPorId(int id) {
+  for (int i = 0; i < MAX_PERSONAS; i++)
+    if (personas[i].activa && personas[i].id == id) return i;
+  return -1;
 }
 
 // Borra la foto más vieja que haya en la flash (para liberar espacio)
@@ -463,10 +507,55 @@ void iniciarFlash() {
 void avisarIgnorada(int i) {
   if (ultimaPersonaAvisada == personas[i].id) return;
   char linea[64];
-  snprintf(linea, sizeof(linea), "persona %d ya registrada (hace %lus): la ignoro",
-           personas[i].id, (millis() - personas[i].ultimaFoto) / 1000);
+  if (personas[i].id == ID_SIN_ROSTRO) {
+    snprintf(linea, sizeof(linea), "objeto que no es rostro: lo ignoro");
+  } else {
+    snprintf(linea, sizeof(linea), "persona %d ya registrada (hace %lus): la ignoro",
+             personas[i].id, (millis() - personas[i].ultimaFoto) / 1000);
+  }
   info(linea);
   ultimaPersonaAvisada = personas[i].id;
+}
+
+// Envía la foto actual (ultimaJpg) a la PC y lee su respuesta.
+// Devuelve PC_NUEVA / PC_CONOCIDA / PC_SIN_ROSTRO, o PC_FALLA si no hay
+// PC configurada o no respondió. 'persona' y 'dato' (número de foto, o
+// segundos desde su foto) se llenan con lo que diga la PC.
+bool pcCaida = false;               // la última vez la PC no respondió
+unsigned long pcCaidaDesde = 0;
+
+int preguntarPC(int &persona, int &dato) {
+  if (strlen(PC_IP) == 0 || !hayWiFi || WiFi.status() != WL_CONNECTED || ultimaJpgLen == 0)
+    return PC_FALLA;
+  if (pcCaida && millis() - pcCaidaDesde < PC_REINTENTO_MS) return PC_FALLA;  // no insistir
+
+  int resp = PC_FALLA;
+  HTTPClient http;
+  http.setConnectTimeout(PC_TIMEOUT_MS);
+  http.setTimeout(PC_TIMEOUT_MS);
+  String url = String("http://") + PC_IP + ":" + String(PC_PUERTO) + "/rostro";
+  if (http.begin(url)) {
+    http.addHeader("Content-Type", "image/jpeg");
+    if (http.POST(ultimaJpg, ultimaJpgLen) == 200) {
+      String txt = http.getString();
+      txt.trim();
+      if (sscanf(txt.c_str(), "NUEVA %d %d", &persona, &dato) == 2)         resp = PC_NUEVA;
+      else if (sscanf(txt.c_str(), "CONOCIDA %d %d", &persona, &dato) == 2) resp = PC_CONOCIDA;
+      else if (txt == "SIN_ROSTRO")                                         resp = PC_SIN_ROSTRO;
+    }
+    http.end();
+  }
+
+  // Avisar solo cuando cambia (para no llenar el Monitor Serie)
+  if (resp == PC_FALLA) {
+    if (!pcCaida) info("PC no responde: uso la firma de color");
+    pcCaida = true;
+    pcCaidaDesde = millis();
+  } else if (pcCaida) {
+    info("PC conectada de nuevo");
+    pcCaida = false;
+  }
+  return resp;
 }
 
 // Se llama con el rostro NUEVO que se está centrando: cuando queda centrado
@@ -485,9 +574,45 @@ void registrar(float cx, float cy, float conf) {
 
   float firma[NFIRMA];
   calcularFirma(cx, cy, firma);
+  char linea[64];
+
+  // ---- 1) Preguntarle a la PC (reconocimiento facial real) ----
+  int idPC = 0, dato = 0;
+  int resp = preguntarPC(idPC, dato);
+  if (resp == PC_NUEVA || resp == PC_CONOCIDA) {
+    // Guardar su firma de color con el número que dio la PC: sirve para
+    // ignorarla de lejos sin tener que preguntar otra vez
+    int j = buscarPorId(idPC);
+    if (j < 0) {
+      j = nuevaPersona(firma, idPC);
+    } else {
+      for (int k = 0; k < NFIRMA; k++)
+        personas[j].firma[k] = 0.6 * personas[j].firma[k] + 0.4 * firma[k];
+    }
+    // Misma hora de la foto que en la PC, así se "olvida" a la vez (5 min)
+    unsigned long hace = (resp == PC_CONOCIDA) ? (unsigned long)dato * 1000UL : 0;
+    personas[j].ultimaFoto = millis() - min(hace, millis());
+
+    if (resp == PC_NUEVA) {
+      snprintf(linea, sizeof(linea), "FOTO #%d persona %d (PC)", dato, idPC);
+      info(linea);
+      ultimaPersonaAvisada = idPC;
+    } else {
+      avisarIgnorada(j);
+    }
+    return;
+  }
+  if (resp == PC_SIN_ROSTRO) {
+    // FOMO creyó ver un rostro (cuadro, monitor, mochila...): ignorarlo 5 min
+    nuevaPersona(firma, ID_SIN_ROSTRO);
+    if (ultimaPersonaAvisada != ID_SIN_ROSTRO) info("no era un rostro (dice la PC): lo ignoro");
+    ultimaPersonaAvisada = ID_SIN_ROSTRO;
+    return;
+  }
+
+  // ---- 2) Sin PC (respaldo): firma de color, como antes ----
   float sim = 0;
   int i = buscarPersona(firma, UMBRAL_MISMA, &sim);   // ya centrado: comparación normal
-  char linea[64];
 
   if (i >= 0) {
     // De cerca resultó ser alguien ya registrado: se mejora su firma con
@@ -498,7 +623,7 @@ void registrar(float cx, float cy, float conf) {
     return;
   }
 
-  int n = nuevaPersona(firma);
+  int n = nuevaPersona(firma, siguienteIdPersona);
   if (guardarFoto(personas[n].id)) {
     snprintf(linea, sizeof(linea), "FOTO #%d persona %d (nueva, s%d)", totalFotos, personas[n].id,
              (int)(sim * 100));

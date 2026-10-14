@@ -6,6 +6,13 @@ dataset/esp32cam/
 dataset/rostros/
 dataset/rostros_extra/
 dataset/_cache/
+dataset/muestra/
+dataset/muestra_revisar/
+
+# Servidor de la PC: fotos de personas y modelos (se descargan solos, ~39 MB)
+pc_servidor/fotos/
+pc_servidor/modelos/
+__pycache__/
 
 # Respaldos y carpetas de compilación
 respaldo_modelos/

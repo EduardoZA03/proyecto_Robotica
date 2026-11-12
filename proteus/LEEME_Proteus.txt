@@ -1,0 +1,24 @@
+VigIA - Simulacion en Proteus (Arduino Uno + 2 servos)
+
+Que se simula:
+  - ATmega328P (Arduino Uno) con el programa real 03_arduino_servos (hex\03_arduino_servos.ino.hex)
+  - Servo PAN en el pin 9 y servo TILT en el pin 10
+  - ESP32_SIMULADO: terminal virtual en el pin 4 (hace de ESP32, 9600 baudios)
+  - MONITOR_SERIE_UNO: terminal virtual en el pin 1 (TX) para ver los mensajes del Arduino
+  - El ESP32-CAM, la camara, la IA y el WiFi NO se pueden simular en Proteus.
+
+Como usarlo:
+  1. Abrir VigIA_servos.pdsprj con Proteus 8.17.
+  2. Clic en Play (abajo a la izquierda).
+  3. Al arrancar, el Arduino entra en modo demo (los servos se mueven solos).
+  4. Hacer clic dentro de la ventana "ESP32_SIMULADO" y escribir una orden + Enter:
+       P140 T40   -> pan a 140 y tilt a 40
+       P95 T88    -> otra posicion
+       C          -> centrar (pan 110, tilt 70)
+       D          -> volver al modo demo
+       ?          -> estado
+  5. En MONITOR_SERIE_UNO aparece "[ESP32] -> destino P.. T.." y los servos giran suave.
+  6. Stop (cuadrado) para terminar.
+
+Si se cambia el programa del Arduino: Arduino IDE -> Programa -> Exportar binario compilado,
+y reemplazar el .hex de la carpeta hex.

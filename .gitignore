@@ -20,3 +20,10 @@ _b7/
 build/
 *.elf
 *.bin
+
+pc_servidor/descartadas/
+
+# Proteus: respaldos automáticos
+Project Backups/
+*.pdsbak
+personas.json

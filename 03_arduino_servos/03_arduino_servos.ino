@@ -1,126 +1,69 @@
-/*
- * VigIA - Paso 3: Control de servos con Arduino Uno
- * ------------------------------------------------------------
- * El Arduino es el "músculo": recibe órdenes de texto y mueve los
- * servos pan-tilt de forma suave y dentro de límites seguros.
- * El ESP32-CAM (el "cerebro") enviará estas órdenes más adelante;
- * por ahora se prueban a mano desde el Monitor Serie.
- *
- * Órdenes (terminar con "Nueva línea"):
- *   P95        -> pan a 95°
- *   T88        -> tilt a 88°
- *   P95 T88    -> ambos a la vez (formato que usará el ESP32)
- *   C          -> centrar ambos
- *   D          -> activar el modo demostración (movimiento automático)
- *   ?          -> mostrar posición actual y límites
- *
- * MODO DEMOSTRACIÓN: al encender, los servos se mueven solos de
- * forma lenta recorriendo los límites seguros (izquierda, derecha,
- * arriba, abajo). Cualquier orden P/T/C lo detiene; "D" lo reactiva.
- *
- * Funcionan por dos vías:
- *   - Monitor Serie del Arduino (USB, 9600 baud) -> pruebas a mano
- *   - Pin 2 (desde IO13 del ESP32-CAM, 9600 baud) -> sistema final
- *
- * Conexiones:
- *   Pin 9   -> naranja servo PAN  (izquierda/derecha)
- *   Pin 10  -> naranja servo TILT (arriba/abajo)
- *   Pin 2   <- IO13 del ESP32-CAM (más adelante)
- *   GND     -> riel (−) común (cargador, servos y ESP32)
- *   Servos rojo/marrón -> cargador 5V (+/−), NUNCA al 5V del Arduino
- *
- * Errores comunes:
- *   - Los servos tiemblan o no se mueven: falta el GND común entre
- *     Arduino y cargador.
- *   - El Arduino se reinicia al mover: los servos están conectados
- *     al 5V del Arduino; pasarlos al cargador.
- *   - No se puede subir este código: desconectar los cables de los
- *     pines 0 y 1, y quitar el puente RESET-GND.
- *   - Escribo órdenes y no pasa nada: en el Monitor Serie elegir
- *     9600 baud y "Nueva línea".
- */
-
 #include <Servo.h>
 #include <SoftwareSerial.h>
 
-// ---- Pines ----
-#define PIN_PAN    9
-#define PIN_TILT  10
-#define PIN_RX_ESP 2   // recibe del ESP32 (IO13)
-#define PIN_TX_ESP 3   // no se usa (el Arduino no responde al ESP32)
+#define PIN_PAN    9          // pin de señal del servo pan (horizontal)
+#define PIN_TILT  10          // pin de señal del servo tilt (vertical)
 
-// ---- Límites en MEDICIÓN: probar de a poco con P y T y anotar ----
-// hasta dónde llega cada servo sin chocar ni tensar cables.
-// Luego fijar aquí los valores definitivos.
-// (13 oct) Medidos por el usuario con el montaje final (cables de pan y
-// tilt corregidos: antes estaban intercambiados)
-#define PAN_MIN     50
-#define PAN_MAX    160
-#define PAN_CENTRO 110
-#define TILT_MIN    10
-#define TILT_MAX   120
-#define TILT_CENTRO 70
+#define PIN_RX_ESP 4          // pin que recibe las órdenes del ESP32 (IO13)
+#define PIN_TX_ESP 3          // pin de envío al ESP32 (no se usa)
 
-// Amplitud del modo demostración (independiente de los límites)
-#define DEMO_PAN  50   // pan recorre 40°-140°
-#define DEMO_TILT 25   // tilt recorre 65°-115°
+#define PAN_MIN     50        // ángulo mínimo del pan
+#define PAN_MAX    160        // ángulo máximo del pan
+#define PAN_CENTRO 110        // ángulo central del pan
+#define TILT_MIN    10        // ángulo mínimo del tilt
+#define TILT_MAX   120        // ángulo máximo del tilt
+#define TILT_CENTRO 70        // ángulo central del tilt
 
-// ---- Sentido de giro (cambiar a true si gira al revés) ----
-// Con "P100" la cámara debe girar hacia TU derecha (mirándola de frente).
-// Con "T100" la cámara debe mirar MÁS ARRIBA.
-#define PAN_INVERTIDO  false
-#define TILT_INVERTIDO false
+#define DEMO_PAN  50          // cuánto gira el pan en el modo demo
+#define DEMO_TILT 25          // cuánto gira el tilt en el modo demo
 
-// ---- Suavidad: perfil con aceleración y frenado ----
-// Cada movimiento arranca despacio, acelera y frena al acercarse al
-// destino (como un auto que no arranca ni frena de golpe).
-// (13 oct) Suave a pedido del usuario: arranques y frenadas lentos para
-// que no se suelte ningún cable ni se mueva la estructura.
-// ¡Si se cambian, actualizar ARDUINO_VEL/ARDUINO_ACEL en el ESP32!
-#define VEL_MAX   50.0   // grados por segundo (velocidad crucero)
-#define ACEL      60.0   // grados por segundo² (qué tan rápido acelera/frena)
-#define PERIODO_MS 10    // cada cuánto se actualiza la posición
+#define PAN_INVERTIDO  false  // invierte el sentido de giro del pan
+#define TILT_INVERTIDO false  // invierte el sentido de giro del tilt
 
-Servo servoPan, servoTilt;
-SoftwareSerial desdeESP(PIN_RX_ESP, PIN_TX_ESP);
+#define VEL_MAX   50.0        // velocidad máxima de los servos (grados/s)
+#define ACEL      60.0        // aceleración de los servos (grados/s²)
+#define PERIODO_MS 10         // cada cuántos ms se actualiza el movimiento
+
+Servo servoPan, servoTilt;                         // los dos servos
+SoftwareSerial desdeESP(PIN_RX_ESP, PIN_TX_ESP);   // puerto serie con el ESP32
 
 struct Eje {
-  float pos;    // posición actual (con decimales, para moverse fino)
-  float vel;    // velocidad actual (grados/s, con signo)
-  int destino;  // ángulo pedido
+  float pos;      // ángulo actual
+  float vel;      // velocidad actual (grados/s)
+  int destino;    // ángulo al que debe llegar
 };
-Eje pan  = {PAN_CENTRO, 0, PAN_CENTRO};
-Eje tilt = {TILT_CENTRO, 0, TILT_CENTRO};
+Eje pan  = {PAN_CENTRO, 0, PAN_CENTRO};    // estado del eje pan
+Eje tilt = {TILT_CENTRO, 0, TILT_CENTRO};  // estado del eje tilt
 #define panDestino  pan.destino
 #define tiltDestino tilt.destino
-unsigned long ultimoPaso = 0;
+unsigned long ultimoPaso = 0;              // momento (ms) del último paso de movimiento
 
-// ---- Modo demostración ----
-#define PAUSA_DEMO_MS 600   // espera en cada punto del recorrido
-const int recorrido[][2] = {   // {pan, tilt}
+#define PAUSA_DEMO_MS 600                  // pausa en cada punto del modo demo
+const int recorrido[][2] = {               // puntos (pan, tilt) que recorre el modo demo
   {PAN_CENTRO - DEMO_PAN, TILT_CENTRO}, {PAN_CENTRO + DEMO_PAN, TILT_CENTRO}, {PAN_CENTRO, TILT_CENTRO},
   {PAN_CENTRO, TILT_CENTRO - DEMO_TILT}, {PAN_CENTRO, TILT_CENTRO + DEMO_TILT}, {PAN_CENTRO, TILT_CENTRO},
 };
-const int PUNTOS = sizeof(recorrido) / sizeof(recorrido[0]);
-bool demoActiva = true;
-int puntoDemo = 0;
-unsigned long llegadaDemo = 0;
-bool esperandoDemo = false;
+const int PUNTOS = sizeof(recorrido) / sizeof(recorrido[0]);   // cantidad de puntos del recorrido
+bool demoActiva = true;                    // true = el modo demo está activo
+int puntoDemo = 0;                         // siguiente punto del recorrido
+unsigned long llegadaDemo = 0;             // momento en que llegó al punto actual
+bool esperandoDemo = false;                // true = está haciendo la pausa en un punto
 
-String bufUSB, bufESP;
+String bufUSB, bufESP;                     // texto recibido por USB y por el ESP32
 
-// Convierte un ángulo con decimales al pulso del servo (544-2400 µs,
-// el mismo rango que usa Servo.write). Así se mueve en fracciones de grado.
+// Convierte un ángulo en el ancho de pulso (µs) del servo
 int aMicrosegundos(float angulo, bool invertido) {
   if (invertido) angulo = 180.0 - angulo;
   return 544 + (int)(angulo * (2400 - 544) / 180.0);
 }
 
+// Envía la posición actual a los dos servos
 void escribirServos() {
   servoPan.writeMicroseconds(aMicrosegundos(pan.pos, PAN_INVERTIDO));
   servoTilt.writeMicroseconds(aMicrosegundos(tilt.pos, TILT_INVERTIDO));
 }
 
+// Muestra en el monitor serie la posición actual y los límites
 void mostrarEstado() {
   Serial.print(F("Pan "));  Serial.print((int)round(pan.pos));
   Serial.print(F(" (")); Serial.print(PAN_MIN); Serial.print('-'); Serial.print(PAN_MAX);
@@ -129,11 +72,10 @@ void mostrarEstado() {
   Serial.println(')');
 }
 
-// Interpreta una orden como "P95 T88", "P95", "T88", "C" o "?"
+// Ejecuta una orden: "#texto" (aviso del ESP32), "?", "D", "C" o "P95 T88"
 void procesarOrden(String orden, const __FlashStringHelper *origen) {
   orden.trim();
 
-  // Líneas de información del ESP32 (empiezan con '#'): solo se muestran
   if (orden.startsWith("#")) {
     Serial.print(F("[ESP32 info] "));
     Serial.println(orden.substring(1));
@@ -152,7 +94,6 @@ void procesarOrden(String orden, const __FlashStringHelper *origen) {
     return;
   }
 
-  // Cualquier otra orden detiene la demostración
   if (demoActiva) {
     demoActiva = false;
     Serial.println(F("Modo demostracion detenido (D para reactivar)"));
@@ -177,7 +118,7 @@ void procesarOrden(String orden, const __FlashStringHelper *origen) {
   Serial.print(F(" T"));            Serial.println(tiltDestino);
 }
 
-// Lee caracteres sin bloquear y procesa la orden al llegar '\n'
+// Junta los caracteres recibidos y procesa la orden al llegar el fin de línea
 void leerLinea(Stream &entrada, String &buf, const __FlashStringHelper *origen) {
   while (entrada.available()) {
     char c = entrada.read();
@@ -190,47 +131,47 @@ void leerLinea(Stream &entrada, String &buf, const __FlashStringHelper *origen) 
   }
 }
 
-// Mueve un eje un instante con aceleración y frenado.
-// Devuelve true si cambió de posición.
+// Avanza un eje hacia su destino con aceleración suave; devuelve true si se movió
 bool actualizarEje(Eje &e, float dt) {
   float falta = e.destino - e.pos;
-  if (fabs(falta) < 0.05 && fabs(e.vel) < 1.0) {   // llegó
+  if (fabs(falta) < 0.05 && fabs(e.vel) < 1.0) {
     e.pos = e.destino;
     e.vel = 0;
     return false;
   }
-  // Velocidad máxima que todavía permite frenar a tiempo: v = sqrt(2·a·d)
+
   float vObjetivo = min(VEL_MAX, sqrt(2.0 * ACEL * fabs(falta)));
   if (falta < 0) vObjetivo = -vObjetivo;
 
-  // Acercar la velocidad actual a la objetivo sin pasar de ACEL
   float dv = vObjetivo - e.vel;
   float maxDv = ACEL * dt;
   e.vel += constrain(dv, -maxDv, maxDv);
 
   float avance = e.vel * dt;
-  if (fabs(avance) > fabs(falta)) avance = falta;   // no pasarse
+  if (fabs(avance) > fabs(falta)) avance = falta;
   e.pos += avance;
   return true;
 }
 
+// Cada PERIODO_MS mueve un poco los dos ejes y actualiza los servos
 void moverSuave() {
   if (millis() - ultimoPaso < PERIODO_MS) return;
   float dt = (millis() - ultimoPaso) / 1000.0;
   ultimoPaso = millis();
-  if (dt > 0.05) dt = 0.05;   // por si el loop se atrasó
+  if (dt > 0.05) dt = 0.05;
 
   bool c1 = actualizarEje(pan, dt);
   bool c2 = actualizarEje(tilt, dt);
   if (c1 || c2) escribirServos();
 }
 
+// Devuelve true si los dos ejes llegaron a su destino y están quietos
 bool llegaron() {
   return pan.vel == 0 && tilt.vel == 0 &&
          pan.pos == pan.destino && tilt.pos == tilt.destino;
 }
 
-// Cuando los servos llegan a un punto, espera y pasa al siguiente
+// En modo demo, pasa al siguiente punto del recorrido tras una pausa
 void avanzarDemo() {
   if (!demoActiva) return;
   if (!llegaron()) return;
@@ -248,12 +189,11 @@ void avanzarDemo() {
   puntoDemo = (puntoDemo + 1) % PUNTOS;
 }
 
+// Inicia los puertos serie, coloca los servos en el centro y muestra el menú
 void setup() {
   Serial.begin(9600);
   desdeESP.begin(9600);
 
-  // Fijar la posición ANTES de attach: así el primer pulso ya es el centro
-  // y el servo no da un salto a una posición aleatoria
   escribirServos();
   servoPan.attach(PIN_PAN);
   servoTilt.attach(PIN_TILT);
@@ -264,6 +204,7 @@ void setup() {
   Serial.println(F("Modo demostracion ACTIVADO (cualquier orden lo detiene)"));
 }
 
+// Lee órdenes por USB y del ESP32, avanza el demo y mueve los servos
 void loop() {
   leerLinea(Serial,   bufUSB, F("[USB]"));
   leerLinea(desdeESP, bufESP, F("[ESP32]"));

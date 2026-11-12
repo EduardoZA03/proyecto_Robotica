@@ -1,51 +1,3 @@
-/*
- * VigIA - Paso 7: Sistema completo
- * ------------------------------------------------------------
- *  1. Seguimiento de rostros con IA (igual que el Paso 5).
- *  La cámara NO sigue a nadie: recorre el lugar buscando rostros NUEVOS,
- *  los centra y les toma una foto; a los ya registrados los ignora.
- *  2. REGISTRO: toma UNA foto por persona cada 5 minutos.
- *       - Cuando un rostro queda centrado, calcula una "firma de color"
- *         (colores de la cara y la ropa, 64 números). NO es reconocimiento
- *         facial: no identifica a nadie, solo distingue "persona A" de
- *         "persona B" durante unos minutos (privacidad por diseño).
- *       - Si la firma se parece a alguien fotografiado hace menos de
- *         5 minutos -> no repite la foto.
- *       - Si es alguien nuevo -> guarda una foto 640x480.
- *  3. GALERÍA por WiFi: http://<IP>/ muestra las fotos con fecha y hora
- *     (se guardan en la memoria FLASH, máximo MAX_FOTOS, y NO se pierden al
- *     reiniciar o apagar; la microSD no funciona).
- *  4. (14 oct) RECONOCIMIENTO FACIAL EN LA PC: si en secretos.h está PC_IP y
- *     la PC corre pc_servidor\servidor_vigia.py, al centrar un rostro se le
- *     envía la foto a la PC, que decide con reconocimiento facial real
- *     (YuNet + SFace: ojos, nariz y boca) si es NUEVA o CONOCIDA. La PC guarda
- *     la foto y la muestra en su galería http://<IP de la PC>:8000/
- *     Si la PC no responde, se usa la firma de color de siempre (respaldo) y
- *     la foto va a la flash del ESP32.
- *
- * Conexiones (modo USO):
- *   ESP32 IO13 -> Arduino pin 2     ESP32 GND -> GND común
- *   ESP32 5V   -> + del CARGADOR (con WiFi, el 5V del Arduino no alcanza)
- *
- * Requiere:
- *   - Librería de Edge Impulse MUCKCITO-project-1_inferencing
- *   - secretos.h con el WiFi (pestaña junto a este archivo) y, para usar la
- *     PC, la línea:  #define PC_IP "192.168.18.50"  (la IP que muestra el
- *     servidor al arrancar)
- *
- * Mensajes en el Monitor Serie del Arduino (9600):
- *   [ESP32 info] rostros 1 | IA 700 | x48 y50 c95   -> seguimiento
- *   [ESP32 info] FOTO #3 persona 2 (PC)               -> la PC guardó la foto
- *   [ESP32 info] persona 2 ya registrada (hace 40s)   -> no repite
- *   [ESP32 info] no era un rostro (dice la PC)        -> FOMO se equivocó
- *   [ESP32 info] PC no responde: uso la firma de color -> modo respaldo
- *
- * Errores comunes (PC):
- *   "PC no responde" -> servidor apagado, otra red WiFi, IP de la PC cambió
- *       (actualizar PC_IP y volver a subir) o el firewall de Windows bloquea
- *       Python (permitirlo en "Redes privadas").
- */
-
 #include <MUCKCITO-project-1_inferencing.h>
 #include "edge-impulse-sdk/dsp/image/image.hpp"
 #include "esp_camera.h"
@@ -60,25 +12,33 @@
 #include "soc/rtc_cntl_reg.h"
 #include "secretos.h"
 
-// ---- Reconocimiento facial en la PC (pc_servidor\servidor_vigia.py) ----
-// La IP se pone en secretos.h:  #define PC_IP "192.168.18.50"
-// Si no está (secretos.h viejo), funciona como antes, solo con la firma de color.
+#define VIGILANTE_S  90                       // segundos máximos de un ciclo antes de reiniciar
+#define MARCA_VIGILANTE 0x56494721UL          // marca que indica "reinició el vigilante"
+RTC_NOINIT_ATTR char pasoGuardado[20];        // último paso del ciclo (sobrevive al reinicio)
+RTC_NOINIT_ATTR uint32_t marcaVigilante;      // guarda MARCA_VIGILANTE antes de reiniciar
+volatile unsigned long inicioCiclo = 0;       // momento (ms) en que empezó el ciclo actual
+
+#define paso(p) do { strncpy(pasoGuardado, (p), sizeof(pasoGuardado) - 1); \
+                     pasoGuardado[sizeof(pasoGuardado) - 1] = 0; } while (0)
+
 #ifndef PC_IP
-#define PC_IP ""
+#define PC_IP ""                              // IP de la PC (vacía = trabajar sin PC)
 #endif
-#define PC_PUERTO        8000
-#define PC_TIMEOUT_MS    4000    // espera máxima de la respuesta de la PC
-#define PC_REINTENTO_MS  30000   // si la PC falló, no volver a probar hasta 30 s después
-// Respuestas de la PC (con #define y no enum: el preprocesador del .ino
-// pone los prototipos antes del enum y no compila)
-#define PC_FALLA      0
+#define PC_PUERTO        8000                 // puerto del servidor de Python
+
+#define PC_TIMEOUT_MS    5000                 // espera máxima de una respuesta de la PC
+#define ESCANEO_MS       4000                 // cada cuánto se pide a la PC que revise la imagen
+#define GRADOS_POR_PIXEL_CAM (49.0 / CAM_ALTO) // grados por píxel en la foto completa
+#define PC_REINTENTO_MS  30000                // espera antes de volver a probar una PC caída
+
+#define PC_FALLA      0                       // respuestas posibles de la PC
 #define PC_NUEVA      1
 #define PC_CONOCIDA   2
 #define PC_SIN_ROSTRO 3
-#define ID_SIN_ROSTRO 0          // "persona" 0 = algo que FOMO creyó rostro y no lo es
+#define PC_REPETIR    4
+#define ID_SIN_ROSTRO 0                       // número de "persona" para lo que no es un rostro
 
-// ---- Pines de la cámara (AI-Thinker) ----
-#define PWDN_GPIO_NUM     32
+#define PWDN_GPIO_NUM     32                  // pines de la cámara (placa AI-Thinker)
 #define RESET_GPIO_NUM    -1
 #define XCLK_GPIO_NUM      0
 #define SIOD_GPIO_NUM     26
@@ -95,133 +55,112 @@
 #define HREF_GPIO_NUM     23
 #define PCLK_GPIO_NUM     22
 
-// ---- Enlace con el Arduino (UART2, solo TX) ----
-#define PIN_TX_ARDUINO 13
-#define PIN_RX_ARDUINO 12   // no se conecta (no usar GPIO16: es la PSRAM)
-HardwareSerial enlace(2);
+#define PIN_TX_ARDUINO 13                     // pin que envía las órdenes al Arduino Uno
+#define PIN_RX_ARDUINO 12                     // pin de recepción (no se usa)
+HardwareSerial enlace(2);                     // puerto serie hacia el Arduino Uno
 
-// ---- Imagen ----
-// 640x480: la foto del registro sale con buena calidad. Para la IA se
-// recorta el centro cuadrado (480x480) y se reduce a 96x96, que equivale
-// al mismo encuadre que antes (el campo de visión no cambia).
-#define CAM_ANCHO 640
-#define CAM_ALTO  480
-#define RECORTE_X ((CAM_ANCHO - CAM_ALTO) / 2)                 // 80
-#define ESCALA    ((float)CAM_ALTO / EI_CLASSIFIER_INPUT_WIDTH)  // 5
-#define GRADOS_POR_PIXEL_MODELO (49.0 / EI_CLASSIFIER_INPUT_WIDTH)
-#define JPG_MAX   (150 * 1024)   // tamaño máximo esperado de una foto JPEG
+#define CAM_ANCHO 640                         // ancho de la foto
+#define CAM_ALTO  480                         // alto de la foto
+#define RECORTE_X ((CAM_ANCHO - CAM_ALTO) / 2) // borde que se recorta para dejarla cuadrada
+#define ESCALA    ((float)CAM_ALTO / EI_CLASSIFIER_INPUT_WIDTH)   // píxeles de foto por píxel del modelo
+#define GRADOS_POR_PIXEL_MODELO (49.0 / EI_CLASSIFIER_INPUT_WIDTH) // grados por píxel del modelo
+#define JPG_MAX   (150 * 1024)                // tamaño máximo de una foto JPEG
 
-// ---- Seguimiento (valores probados el 13-14 oct) ----
-#define INVERTIR_PAN   true
-#define INVERTIR_TILT  true
-#define GANANCIA       0.65
-#define MARGEN_CONF    0.15
-#define ZONA_MUERTA    4
-#define PASO_MAX       15
-#define UMBRAL         0.30
+#define INVERTIR_PAN   true                   // invierte el sentido del pan (cámara de cabeza)
+#define INVERTIR_TILT  true                   // invierte el sentido del tilt
+#define GANANCIA       0.65                   // fracción del error que se corrige en cada paso
+#define MARGEN_CONF    0.15                   // diferencia de confianza aceptada respecto al mejor rostro
+#define ZONA_MUERTA    4                      // error (píxeles) que se considera centrado
+#define PASO_MAX       15                     // máximo de grados por corrección
+#define UMBRAL         0.30                   // confianza mínima para aceptar un rostro
 
-// ---- "Mover, esperar, mirar" (iguales al Arduino) ----
-#define ARDUINO_VEL   50.0
-#define ARDUINO_ACEL  60.0
-#define ASENTAR_MS    120
+#define ARDUINO_VEL   50.0                    // velocidad de los servos (igual que en el Uno)
+#define ARDUINO_ACEL  60.0                    // aceleración de los servos (igual que en el Uno)
+#define ASENTAR_MS    120                     // espera extra para que el brazo se detenga
 
-// ---- Límites (iguales al Arduino) ----
-#define PAN_MIN     50
+#define PAN_MIN     50                        // límites y centro de los servos
 #define PAN_MAX    160
 #define PAN_CENTRO 110
 #define TILT_MIN    10
 #define TILT_MAX   120
 #define TILT_CENTRO 70
 
-// ---- Al perder el rostro ----
-#define ESPERA_QUIETO   2
-#define BORDE_PX       24
-#define PASO_BORDE     20
-#define BUSQ_PAN_MIN   60
+#define ESPERA_QUIETO   2                     // ciclos sin rostro antes de empezar a buscar
+#define BORDE_PX       24                     // píxeles desde el borde que cuentan como "salió por el borde"
+#define PASO_BORDE     20                     // grados que gira hacia el borde por donde salió
+#define BUSQ_PAN_MIN   60                     // límites del recorrido de búsqueda
 #define BUSQ_PAN_MAX  155
-#define BUSQ_PASO      25
+#define BUSQ_PASO      25                     // grados por paso de búsqueda
 
-// ---- Registro de fotos ----
-#define VENTANA_MS     (5UL * 60UL * 1000UL)  // 5 minutos por persona
-#define CENTRADO_PX    8       // el rostro debe estar a menos de esto del centro
-#define CONFIRMACIONES 2       // detecciones centradas SEGUIDAS antes de tomar la foto
-#define ESPERA_INICIO_MS 3000  // sin fotos al encender (la cámara ajusta la luz)
-#define CONF_FOTO      0.60    // confianza mínima para tomar la foto
-// Similitud mínima para decir "es la misma persona" (0..1).
-//   Si en el lugar se REPITEN fotos de la misma persona -> bajarlo (0.65).
-//   Si CONFUNDE a personas distintas (no les toma foto)  -> subirlo (0.75).
-// Se prefiere estricto: es peor perder a alguien que repetir una foto.
-// (14 oct, opción A "estricto") Medido en prueba: la misma persona daba
-// s91-95 y otra persona distinta s80-89 (se cruzan). Se eligió no perder
-// a nadie aunque se repitan fotos: casi nunca se asume "es la misma".
-#define UMBRAL_MISMA   0.92
-// Para IGNORAR un rostro visto de lejos / descentrado (sin ir a verlo) se
-// exige una coincidencia mucho mayor: de lejos las firmas se parecen
-// demasiado y confundía a personas nuevas con alguien ya registrado.
-// Si hay duda, la cámara se acerca a verlo y compara ya centrado.
-#define UMBRAL_IGNORAR 0.96
-#define CICLOS_FIN_SEGUIMIENTO 4  // ciclos sin nadie para volver a avisar "ya registrada"
-#define MAX_PERSONAS   30      // personas registradas a la vez (para lugares con gente)
-#define MAX_FOTOS      40      // fotos guardadas en la FLASH (~20 KB c/u en ~1 MB; las más
-                               // viejas se borran). Sobreviven a reinicios y apagados.
+#define VENTANA_MS     (5UL * 60UL * 1000UL)  // tiempo que se ignora a una persona ya fotografiada
+#define CENTRADO_PX    8                      // error máximo (píxeles) para tomar la foto
+#define CONFIRMACIONES 2                      // ciclos centrado seguidos antes de la foto
+#define ESPERA_INICIO_MS 3000                 // espera al arrancar antes de tomar fotos
+#define CONF_FOTO      0.60                   // confianza mínima para tomar la foto
 
-// ===================================================================
-uint8_t *imagen  = nullptr;   // RGB888 640x480 (BGR) en PSRAM
-uint8_t *entrada = nullptr;   // RGB888 96x96 para el modelo
-uint8_t *ultimaJpg = nullptr; // copia del JPEG de la última captura
-size_t   ultimaJpgLen = 0;
+#define UMBRAL_MISMA   0.92                   // similitud de color para decir "misma persona" (sin PC)
 
-float panCmd = PAN_CENTRO, tiltCmd = TILT_CENTRO;
-int ultimoPanEnviado = -1, ultimoTiltEnviado = -1;
-int ciclosSinRostro = 0;
-int sentidoBusqueda = 1;
-float ultimoX = -1, ultimoY = -1;
-float vistoX = -1;
-float panVisto = PAN_CENTRO;
+#define UMBRAL_IGNORAR 0.96                   // similitud de color para ignorar de lejos
+#define CICLOS_FIN_SEGUIMIENTO 4              // ciclos sin rostro para olvidar el último aviso
+#define MAX_PERSONAS   30                     // personas recordadas a la vez
+#define MAX_FOTOS      40                     // fotos guardadas en la flash
 
-// ---- Personas vistas recientemente (solo firma de color + hora) ----
-#define NFIRMA 64
+uint8_t *imagen  = nullptr;                   // foto completa en RGB
+uint8_t *entrada = nullptr;                   // imagen reducida para el modelo
+uint8_t *ultimaJpg = nullptr;                 // copia JPEG de la última foto
+size_t   ultimaJpgLen = 0;                    // tamaño de esa copia
+
+float panCmd = PAN_CENTRO, tiltCmd = TILT_CENTRO;   // ángulos que se quieren
+int ultimoPanEnviado = -1, ultimoTiltEnviado = -1;  // últimos ángulos enviados al Uno
+int ciclosSinRostro = 0;                      // ciclos seguidos sin rostro nuevo
+int sentidoBusqueda = 1;                      // sentido del giro al buscar (1 o -1)
+float ultimoX = -1, ultimoY = -1;             // posición del último rostro seguido
+float vistoX = -1;                            // x del último rostro visto (para saber por dónde salió)
+float panVisto = PAN_CENTRO;                  // pan cuando se vio ese rostro
+
+#define NFIRMA 64                             // números de la firma de color
 struct Persona {
-  bool activa;
-  int id;
-  float firma[NFIRMA];
-  unsigned long ultimaFoto;   // millis() de su última foto
+  bool activa;                                // true = se recuerda
+  int id;                                     // número de persona
+  float firma[NFIRMA];                        // firma de color de la cabeza
+  unsigned long ultimaFoto;                   // momento de su última foto
+  unsigned long verificada;                   // último momento en que la PC la confirmó
 };
-Persona personas[MAX_PERSONAS];
-int siguienteIdPersona = 1;
-int ultimaPersonaAvisada = -1;
-int centradoSeguidas = 0;             // detecciones centradas consecutivas (para confirmar)
 
-// ---- Fotos guardadas en la memoria FLASH (LittleFS) ----
-// Cada foto es un archivo "/f<numero>_p<persona>_t<hora>.jpg". Como están en
-// la flash, NO se pierden si el ESP32 se reinicia o se desenchufa. Aquí solo
-// se guarda la información de cada una (la imagen se lee del archivo).
+#define VERIF_MS  20000UL                     // tras este tiempo se vuelve a confirmar con la PC
+
+#define EVITAR_N       4                      // lugares que se pueden evitar a la vez
+#define EVITAR_GRADOS  10.0                   // radio (grados) de un lugar evitado
+float evitarPan[EVITAR_N], evitarTilt[EVITAR_N];   // posición de cada lugar evitado
+unsigned long evitarHasta[EVITAR_N] = {0};    // hasta cuándo se evita cada lugar
+Persona personas[MAX_PERSONAS];               // personas recordadas
+int siguienteIdPersona = 1;                   // número para la próxima persona nueva
+int ultimaPersonaAvisada = -1;                // última persona anunciada (evita repetir avisos)
+int centradoSeguidas = 0;                     // ciclos seguidos con el rostro centrado
+
 struct Foto {
-  bool usada;
-  int n;              // número de foto (sigue contando después de reiniciar)
-  int persona;
-  time_t hora;        // hora real (0 si no había NTP)
+  bool usada;                                 // true = la casilla tiene foto
+  int n;                                      // número de foto
+  int persona;                                // número de persona
+  time_t hora;                                // hora en que se tomó
 };
-Foto fotos[MAX_FOTOS];
-int totalFotos = 0;                 // próximo número de foto (guardado en Preferences)
-SemaphoreHandle_t candado;          // protege fotos[] (lo usa también el servidor web)
-Preferences prefs;
-bool hayFlash = false;
+Foto fotos[MAX_FOTOS];                        // lista de fotos guardadas
+int totalFotos = 0;                           // fotos tomadas desde siempre
+SemaphoreHandle_t candado;                    // evita que la galería y el loop usen las fotos a la vez
+Preferences prefs;                            // memoria donde se guarda totalFotos
+bool hayFlash = false;                        // true = la memoria flash funciona
 
+// Devuelve el nombre de archivo de una foto
 String rutaFoto(const Foto &f) {
   return "/f" + String(f.n) + "_p" + String(f.persona) + "_t" + String((long)f.hora) + ".jpg";
 }
 
-WebServer servidor(80);
-bool hayWiFi = false;
-// Código único de cada arranque: va en la dirección de cada foto para que
-// el navegador NO muestre fotos viejas guardadas en su caché (la numeración
-// de fotos vuelve a empezar en 0 cada vez que el ESP32 se reinicia).
-uint32_t idArranque = 0;
+WebServer servidor(80);                       // servidor web de la galería
+bool hayWiFi = false;                         // true = conectado al WiFi
 
-// ===================================================================
-//  Cámara y modelo
-// ===================================================================
+uint32_t idArranque = 0;                      // número al azar de cada arranque (evita la caché del navegador)
+
+// Configura e inicia la cámara
 bool iniciarCamara() {
   camera_config_t config = {};
   config.ledc_channel = LEDC_CHANNEL_0;
@@ -240,25 +179,24 @@ bool iniciarCamara() {
   config.pin_reset = RESET_GPIO_NUM;
   config.xclk_freq_hz = 10000000;
   config.pixel_format = PIXFORMAT_JPEG;
-  config.frame_size   = FRAMESIZE_VGA;     // 640x480
+  config.frame_size   = FRAMESIZE_VGA;
   config.jpeg_quality = 12;
   config.fb_count     = 2;
   config.fb_location  = CAMERA_FB_IN_PSRAM;
   config.grab_mode    = CAMERA_GRAB_LATEST;
   if (esp_camera_init(&config) != ESP_OK) return false;
 
-  // Montada de cabeza: girar la imagen 180°
   sensor_t *s = esp_camera_sensor_get();
   s->set_vflip(s, 1);
   s->set_hmirror(s, 1);
   return true;
 }
 
-// Captura: guarda una copia del JPEG (por si hay que registrarlo),
-// lo decodifica a 640x480 y prepara la entrada 96x96 del modelo
 void reducirAModelo();
 
+// Toma una foto, guarda su copia JPEG y la prepara para el modelo
 bool capturar() {
+  paso("camara");
   camera_fb_t *fb = esp_camera_fb_get();
   if (!fb) return false;
   if (fb->len <= JPG_MAX) {
@@ -267,6 +205,7 @@ bool capturar() {
   } else {
     ultimaJpgLen = 0;
   }
+  paso("decodificar");
   bool ok = fmt2rgb888(fb->buf, fb->len, PIXFORMAT_JPEG, imagen);
   esp_camera_fb_return(fb);
   if (!ok) return false;
@@ -274,14 +213,10 @@ bool capturar() {
   return true;
 }
 
-// Recorta el centro 480x480 de la imagen 640x480 y lo reduce a 96x96
-// promediando bloques de 5x5 píxeles. Escribe directo en 'entrada' (27 KB).
-// OJO: no usar crop_and_interpolate_rgb888 de Edge Impulse con un buffer
-// de salida distinto: primero copia el recorte COMPLETO (480x480x3 = 690 KB)
-// en el destino y desborda la memoria (causaba "Guru Meditation" al arrancar).
+// Recorta la foto al centro y la achica al tamaño del modelo (96x96)
 void reducirAModelo() {
-  const int lado = EI_CLASSIFIER_INPUT_WIDTH;    // 96
-  const int bloque = (int)ESCALA;                // 5
+  const int lado = EI_CLASSIFIER_INPUT_WIDTH;
+  const int bloque = (int)ESCALA;
   for (int v = 0; v < lado; v++) {
     for (int u = 0; u < lado; u++) {
       int sB = 0, sG = 0, sR = 0;
@@ -294,23 +229,21 @@ void reducirAModelo() {
       }
       const int n = bloque * bloque;
       uint8_t *out = entrada + (v * lado + u) * 3;
-      out[0] = sB / n; out[1] = sG / n; out[2] = sR / n;   // se mantiene el orden BGR
+      out[0] = sB / n; out[1] = sG / n; out[2] = sR / n;
     }
   }
 }
 
+// Entrega los píxeles de la imagen reducida al modelo de Edge Impulse
 static int obtenerDatos(size_t offset, size_t largo, float *salida) {
   size_t ix = offset * 3;
   for (size_t i = 0; i < largo; i++, ix += 3) {
-    // La cámara entrega BGR: se reordena a RGB
     salida[i] = (entrada[ix + 2] << 16) + (entrada[ix + 1] << 8) + entrada[ix];
   }
   return 0;
 }
 
-// ===================================================================
-//  Movimiento
-// ===================================================================
+// Calcula cuánto tarda el Uno en girar esos grados (ms)
 unsigned long tiempoMovimiento(float grados) {
   if (grados <= 0) return 0;
   float dAcel = ARDUINO_VEL * ARDUINO_VEL / ARDUINO_ACEL;
@@ -320,6 +253,7 @@ unsigned long tiempoMovimiento(float grados) {
   return (unsigned long)(t * 1000);
 }
 
+// Envía la nueva posición al Uno y espera a que el brazo se detenga
 void enviarPosicion() {
   int p = (int)round(panCmd), t = (int)round(tiltCmd);
   if (p == ultimoPanEnviado && t == ultimoTiltEnviado) return;
@@ -330,32 +264,24 @@ void enviarPosicion() {
   enlace.printf("P%d T%d\n", p, t);
   ultimoPanEnviado = p;
   ultimoTiltEnviado = t;
+  paso("mover");
   delay(tiempoMovimiento(grados) + ASENTAR_MS);
-  camera_fb_t *fb = esp_camera_fb_get();   // descartar la imagen movida
+  paso("descartar");
+  camera_fb_t *fb = esp_camera_fb_get();
   if (fb) esp_camera_fb_return(fb);
 }
 
+// Envía un mensaje al Uno (lo muestra en su monitor serie) y al monitor del ESP32
 void info(const char *texto) {
   enlace.printf("#%s\n", texto);
   Serial.println(texto);
 }
 
-// ===================================================================
-//  Registro: firma de color y fotos
-// ===================================================================
-
-// Firma de la persona centrada en la CABEZA (no en la ropa: en el
-// laboratorio todos usan bata blanca, así que la ropa no sirve para
-// distinguir). La cabeza se divide en 3 franjas:
-//   franja 0: pelo / frente     franja 1: ojos / nariz     franja 2: boca / mentón
-// Por franja: histograma de cromaticidad 4x4 (r = R/suma, g = G/suma)
-// -> tono de piel, color de pelo, lentes, barba. Más un histograma de
-// brillo (16 niveles) de toda la cabeza. Cada parte pesa 1/4 del total.
-// (cx, cy) en coordenadas del modelo (96x96). 3*16 + 16 = 64 casillas.
+// Calcula la firma de color de la cabeza en tres franjas (pelo, ojos, boca)
 void calcularFirma(float cx, float cy, float firma[NFIRMA]) {
   int fx = RECORTE_X + (int)(cx * ESCALA);
   int fy = (int)(cy * ESCALA);
-  const int limites[4] = { fy - 70, fy - 25, fy + 15, fy + 55 };  // bordes de las franjas
+  const int limites[4] = { fy - 70, fy - 25, fy + 15, fy + 55 };
   int x0 = max(0, fx - 45), x1 = min(CAM_ANCHO - 1, fx + 45);
   for (int i = 0; i < NFIRMA; i++) firma[i] = 0;
   float totalFranja[3] = {0, 0, 0}, totalBrillo = 0;
@@ -364,41 +290,39 @@ void calcularFirma(float cx, float cy, float firma[NFIRMA]) {
     int y0 = max(0, limites[f]), y1 = min(CAM_ALTO - 1, limites[f + 1]);
     for (int y = y0; y < y1; y += 2) {
       for (int x = x0; x <= x1; x += 2) {
-        uint8_t *px = imagen + (y * CAM_ANCHO + x) * 3;   // B, G, R
+        uint8_t *px = imagen + (y * CAM_ANCHO + x) * 3;
         int suma = px[0] + px[1] + px[2];
-        firma[48 + min(15, suma / 48)] += 1;              // brillo (0..765 -> 16 niveles)
+        firma[48 + min(15, suma / 48)] += 1;
         totalBrillo += 1;
-        if (suma < 60) continue;                          // muy oscuro: el color no es fiable
-        int r = (px[2] * 4) / (suma + 1);                 // 0..3
-        int g = (px[1] * 4) / (suma + 1);                 // 0..3
+        if (suma < 60) continue;
+        int r = (px[2] * 4) / (suma + 1);
+        int g = (px[1] * 4) / (suma + 1);
         firma[f * 16 + r * 4 + g] += 1;
         totalFranja[f] += 1;
       }
     }
   }
-  // Normalizar: cada franja y el brillo suman 0.25 (total = 1)
+
   for (int f = 0; f < 3; f++)
     if (totalFranja[f] > 0) for (int k = 0; k < 16; k++) firma[f * 16 + k] *= 0.25 / totalFranja[f];
   if (totalBrillo > 0) for (int k = 48; k < 64; k++) firma[k] *= 0.25 / totalBrillo;
 }
 
-// 1.0 = colores idénticos, 0.0 = nada en común
+// Compara dos firmas de color (0 = distintas, 1 = iguales)
 float similitud(const float *a, const float *b) {
   float s = 0;
   for (int i = 0; i < NFIRMA; i++) s += min(a[i], b[i]);
   return s;
 }
 
-// Devuelve el índice de la persona registrada hace < 5 min que más se
-// parece, si supera 'umbral' (o -1). En *simMax deja la mayor similitud
-// encontrada (para mostrarla en los mensajes y poder ajustar los umbrales).
+// Busca la persona recordada más parecida; olvida a las que pasaron los 5 minutos
 int buscarPersona(const float *firma, float umbral, float *simMax) {
   int mejor = -1;
   float mejorSim = 0;
   unsigned long ahora = millis();
   for (int i = 0; i < MAX_PERSONAS; i++) {
     if (!personas[i].activa) continue;
-    if (ahora - personas[i].ultimaFoto > VENTANA_MS) {   // pasaron 5 min: se olvida
+    if (ahora - personas[i].ultimaFoto > VENTANA_MS) {
       personas[i].activa = false;
       continue;
     }
@@ -409,33 +333,33 @@ int buscarPersona(const float *firma, float umbral, float *simMax) {
   return (mejorSim >= umbral) ? mejor : -1;
 }
 
-// Registra una persona con el número 'id' (lo da la PC, o siguienteIdPersona
-// en modo respaldo). Devuelve su índice en personas[].
+// Guarda una persona nueva (si no hay espacio, reemplaza a la más antigua)
 int nuevaPersona(const float *firma, int id) {
   int libre = -1;
   unsigned long masVieja = 0;
   for (int i = 0; i < MAX_PERSONAS; i++) {
     if (!personas[i].activa) { libre = i; break; }
     unsigned long edad = millis() - personas[i].ultimaFoto;
-    if (edad >= masVieja) { masVieja = edad; libre = i; }   // si está lleno, reusar la más vieja
+    if (edad >= masVieja) { masVieja = edad; libre = i; }
   }
   Persona &p = personas[libre];
   p.activa = true;
   p.id = id;
-  if (id >= siguienteIdPersona) siguienteIdPersona = id + 1;  // no repetir números de la PC
+  if (id >= siguienteIdPersona) siguienteIdPersona = id + 1;
   memcpy(p.firma, firma, sizeof(p.firma));
   p.ultimaFoto = millis();
+  p.verificada = millis();
   return libre;
 }
 
-// Índice de la persona con ese número (o -1)
+// Busca una persona recordada por su número
 int buscarPorId(int id) {
   for (int i = 0; i < MAX_PERSONAS; i++)
     if (personas[i].activa && personas[i].id == id) return i;
   return -1;
 }
 
-// Borra la foto más vieja que haya en la flash (para liberar espacio)
+// Borra la foto más antigua de la flash
 bool borrarMasVieja() {
   int idx = -1;
   for (int i = 0; i < MAX_FOTOS; i++)
@@ -446,26 +370,27 @@ bool borrarMasVieja() {
   return true;
 }
 
+// Guarda la última foto en la flash con el número de persona
 bool guardarFoto(int idPersona) {
   if (ultimaJpgLen == 0 || !hayFlash) return false;
   xSemaphoreTake(candado, portMAX_DELAY);
 
   Foto &f = fotos[totalFotos % MAX_FOTOS];
-  if (f.usada) { LittleFS.remove(rutaFoto(f)); f.usada = false; }   // el lugar de la más vieja
-  // Si no queda espacio en la flash, borrar las más viejas
+  if (f.usada) { LittleFS.remove(rutaFoto(f)); f.usada = false; }
+
   while (LittleFS.totalBytes() - LittleFS.usedBytes() < ultimaJpgLen + 16 * 1024) {
     if (!borrarMasVieja()) break;
   }
 
   Foto nueva = { true, totalFotos, idPersona, time(nullptr) };
-  if (nueva.hora < 1700000000) nueva.hora = 0;   // sin hora real
+  if (nueva.hora < 1700000000) nueva.hora = 0;
   File arch = LittleFS.open(rutaFoto(nueva), "w");
   bool ok = arch && arch.write(ultimaJpg, ultimaJpgLen) == ultimaJpgLen;
   if (arch) arch.close();
   if (ok) {
     f = nueva;
     totalFotos++;
-    prefs.putInt("total", totalFotos);   // el número sigue después de reiniciar
+    prefs.putInt("total", totalFotos);
   } else {
     LittleFS.remove(rutaFoto(nueva));
   }
@@ -473,11 +398,11 @@ bool guardarFoto(int idPersona) {
   return ok;
 }
 
-// Al arrancar: monta la flash y carga la lista de fotos que ya había
+// Monta la flash y carga la lista de fotos que ya estaban guardadas
 void iniciarFlash() {
   prefs.begin("vigia", false);
   totalFotos = prefs.getInt("total", 0);
-  if (!LittleFS.begin(true)) {   // true = formatear si es la primera vez
+  if (!LittleFS.begin(true)) {
     info("ERROR flash: fotos no se guardaran");
     return;
   }
@@ -494,7 +419,7 @@ void iniciarFlash() {
       fotos[n % MAX_FOTOS] = { true, n, p, (time_t)t };
       cargadas++;
     } else {
-      LittleFS.remove("/" + nombre);   // archivo viejo o desconocido
+      LittleFS.remove("/" + nombre);
     }
     arch = raiz.openNextFile();
   }
@@ -503,7 +428,7 @@ void iniciarFlash() {
   info(linea);
 }
 
-// Avisa (una sola vez seguida) que se está ignorando a una persona registrada
+// Avisa (una sola vez) que se ignora a una persona ya registrada
 void avisarIgnorada(int i) {
   if (ultimaPersonaAvisada == personas[i].id) return;
   char linea[64];
@@ -517,37 +442,35 @@ void avisarIgnorada(int i) {
   ultimaPersonaAvisada = personas[i].id;
 }
 
-// Envía la foto actual (ultimaJpg) a la PC y lee su respuesta.
-// Devuelve PC_NUEVA / PC_CONOCIDA / PC_SIN_ROSTRO, o PC_FALLA si no hay
-// PC configurada o no respondió. 'persona' y 'dato' (número de foto, o
-// segundos desde su foto) se llenan con lo que diga la PC.
-bool pcCaida = false;               // la última vez la PC no respondió
-unsigned long pcCaidaDesde = 0;
+bool pcCaida = false;                         // true = la PC no respondió
+unsigned long pcCaidaDesde = 0;               // momento en que dejó de responder
 
-int preguntarPC(int &persona, int &dato) {
+// Envía la última foto a la PC (ruta /rostro o /escanear) y devuelve su respuesta
+bool enviarAPC(const char *ruta, String &txt) {
   if (strlen(PC_IP) == 0 || !hayWiFi || WiFi.status() != WL_CONNECTED || ultimaJpgLen == 0)
-    return PC_FALLA;
-  if (pcCaida && millis() - pcCaidaDesde < PC_REINTENTO_MS) return PC_FALLA;  // no insistir
-
-  int resp = PC_FALLA;
+    return false;
+  if (pcCaida && millis() - pcCaidaDesde < PC_REINTENTO_MS) return false;
+  bool ok = false;
   HTTPClient http;
   http.setConnectTimeout(PC_TIMEOUT_MS);
   http.setTimeout(PC_TIMEOUT_MS);
-  String url = String("http://") + PC_IP + ":" + String(PC_PUERTO) + "/rostro";
+  String url = String("http://") + PC_IP + ":" + String(PC_PUERTO) + ruta;
   if (http.begin(url)) {
     http.addHeader("Content-Type", "image/jpeg");
     if (http.POST(ultimaJpg, ultimaJpgLen) == 200) {
-      String txt = http.getString();
+      txt = http.getString();
       txt.trim();
-      if (sscanf(txt.c_str(), "NUEVA %d %d", &persona, &dato) == 2)         resp = PC_NUEVA;
-      else if (sscanf(txt.c_str(), "CONOCIDA %d %d", &persona, &dato) == 2) resp = PC_CONOCIDA;
-      else if (txt == "SIN_ROSTRO")                                         resp = PC_SIN_ROSTRO;
+      ok = txt.length() > 0 && !txt.startsWith("ERROR");
     }
     http.end();
   }
+  avisarEstadoPC(ok);
+  return ok;
+}
 
-  // Avisar solo cuando cambia (para no llenar el Monitor Serie)
-  if (resp == PC_FALLA) {
+// Avisa cuando la PC deja de responder o vuelve a conectarse
+void avisarEstadoPC(bool ok) {
+  if (!ok) {
     if (!pcCaida) info("PC no responde: uso la firma de color");
     pcCaida = true;
     pcCaidaDesde = millis();
@@ -555,33 +478,69 @@ int preguntarPC(int &persona, int &dato) {
     info("PC conectada de nuevo");
     pcCaida = false;
   }
-  return resp;
 }
 
-// Se llama con el rostro NUEVO que se está centrando: cuando queda centrado
-// y confirmado, vuelve a comparar su firma (ahora bien encuadrada) y, si de
-// verdad es nuevo, toma la foto.
+// Pregunta a la PC si el rostro centrado es nuevo, conocido, no es rostro o hay que repetir
+int preguntarPC(int &persona, int &dato) {
+  String txt;
+  if (!enviarAPC("/rostro", txt)) return PC_FALLA;
+  if (sscanf(txt.c_str(), "NUEVA %d %d", &persona, &dato) == 2)    return PC_NUEVA;
+  if (sscanf(txt.c_str(), "CONOCIDA %d %d", &persona, &dato) == 2) return PC_CONOCIDA;
+  if (txt == "SIN_ROSTRO")                                          return PC_SIN_ROSTRO;
+  if (txt == "REPETIR")                                             return PC_REPETIR;
+  return PC_FALLA;
+}
+
+// Marca la posición actual como lugar a evitar por un tiempo
+void evitarAqui() {
+  int k = 0;
+  for (int i = 0; i < EVITAR_N; i++)
+    if (evitarHasta[i] < evitarHasta[k]) k = i;
+  evitarPan[k] = panCmd;
+  evitarTilt[k] = tiltCmd;
+  evitarHasta[k] = millis() + VERIF_MS;
+  ultimoX = ultimoY = -1;
+}
+
+// Devuelve true si un rostro está en un lugar que se debe evitar
+bool enLugarEvitado(float cx, float cy) {
+  float pan  = panCmd  + (INVERTIR_PAN  ? 1 : -1) * (cx - EI_CLASSIFIER_INPUT_WIDTH / 2.0) * GRADOS_POR_PIXEL_MODELO;
+  float tilt = tiltCmd + (INVERTIR_TILT ? 1 : -1) * (cy - EI_CLASSIFIER_INPUT_HEIGHT / 2.0) * GRADOS_POR_PIXEL_MODELO;
+  for (int i = 0; i < EVITAR_N; i++) {
+    if (millis() >= evitarHasta[i]) continue;
+    if (fabs(pan - evitarPan[i]) < EVITAR_GRADOS && fabs(tilt - evitarTilt[i]) < EVITAR_GRADOS) return true;
+  }
+  return false;
+}
+
+// Devuelve true si el servo ya está en su tope y no puede girar más hacia el rostro
+bool enTope(float err, float cmd, float minimo, float maximo, bool invertir) {
+  float giro = invertir ? err : -err;
+  return (giro < 0 && cmd <= minimo) || (giro > 0 && cmd >= maximo);
+}
+
+// Si el rostro está centrado (o el servo llegó a su tope), decide si se toma la foto
 void registrar(float cx, float cy, float conf) {
   float errX = cx - EI_CLASSIFIER_INPUT_WIDTH / 2.0;
   float errY = cy - EI_CLASSIFIER_INPUT_HEIGHT / 2.0;
+  if (enTope(errX, panCmd, PAN_MIN, PAN_MAX, INVERTIR_PAN)) errX = 0;
+  if (enTope(errY, tiltCmd, TILT_MIN, TILT_MAX, INVERTIR_TILT)) errY = 0;
   if (millis() < ESPERA_INICIO_MS) return;
   if (fabs(errX) > CENTRADO_PX || fabs(errY) > CENTRADO_PX || conf < CONF_FOTO) {
-    centradoSeguidas = 0;              // aún no centrado o detección dudosa
+    centradoSeguidas = 0;
     return;
   }
-  if (++centradoSeguidas < CONFIRMACIONES) return;   // esperar a confirmarlo
+  if (++centradoSeguidas < CONFIRMACIONES) return;
   centradoSeguidas = 0;
 
   float firma[NFIRMA];
   calcularFirma(cx, cy, firma);
   char linea[64];
 
-  // ---- 1) Preguntarle a la PC (reconocimiento facial real) ----
   int idPC = 0, dato = 0;
+  paso("PC");
   int resp = preguntarPC(idPC, dato);
   if (resp == PC_NUEVA || resp == PC_CONOCIDA) {
-    // Guardar su firma de color con el número que dio la PC: sirve para
-    // ignorarla de lejos sin tener que preguntar otra vez
     int j = buscarPorId(idPC);
     if (j < 0) {
       j = nuevaPersona(firma, idPC);
@@ -589,9 +548,11 @@ void registrar(float cx, float cy, float conf) {
       for (int k = 0; k < NFIRMA; k++)
         personas[j].firma[k] = 0.6 * personas[j].firma[k] + 0.4 * firma[k];
     }
-    // Misma hora de la foto que en la PC, así se "olvida" a la vez (5 min)
+
     unsigned long hace = (resp == PC_CONOCIDA) ? (unsigned long)dato * 1000UL : 0;
     personas[j].ultimaFoto = millis() - min(hace, millis());
+    personas[j].verificada = millis();
+    evitarAqui();
 
     if (resp == PC_NUEVA) {
       snprintf(linea, sizeof(linea), "FOTO #%d persona %d (PC)", dato, idPC);
@@ -602,21 +563,22 @@ void registrar(float cx, float cy, float conf) {
     }
     return;
   }
+  if (resp == PC_REPETIR) {
+    info("foto de baja calidad (dice la PC): tomo otra");
+    return;
+  }
   if (resp == PC_SIN_ROSTRO) {
-    // FOMO creyó ver un rostro (cuadro, monitor, mochila...): ignorarlo 5 min
     nuevaPersona(firma, ID_SIN_ROSTRO);
+    evitarAqui();
     if (ultimaPersonaAvisada != ID_SIN_ROSTRO) info("no era un rostro (dice la PC): lo ignoro");
     ultimaPersonaAvisada = ID_SIN_ROSTRO;
     return;
   }
 
-  // ---- 2) Sin PC (respaldo): firma de color, como antes ----
   float sim = 0;
-  int i = buscarPersona(firma, UMBRAL_MISMA, &sim);   // ya centrado: comparación normal
+  int i = buscarPersona(firma, UMBRAL_MISMA, &sim);
 
   if (i >= 0) {
-    // De cerca resultó ser alguien ya registrado: se mejora su firma con
-    // esta vista centrada (así la próxima vez se la reconoce de lejos)
     for (int k = 0; k < NFIRMA; k++)
       personas[i].firma[k] = 0.6 * personas[i].firma[k] + 0.4 * firma[k];
     avisarIgnorada(i);
@@ -634,11 +596,47 @@ void registrar(float cx, float cy, float conf) {
   ultimaPersonaAvisada = personas[n].id;
 }
 
-// ===================================================================
-//  Galería web (corre en el otro núcleo del ESP32)
-// ===================================================================
+unsigned long ultimoEscaneo = 0;              // momento del último escaneo con la PC
+// Cuando el ESP32 no ve rostros, pide a la PC que revise la foto; si ve uno, apunta hacia él
+bool escanearConPC() {
+  bool pcDisponible = strlen(PC_IP) > 0 && hayWiFi && !pcCaida;
+  if (!pcDisponible || millis() - ultimoEscaneo < ESCANEO_MS) return false;
+  ultimoEscaneo = millis();
+  paso("escaneo");
+  String txt;
+  if (!enviarAPC("/escanear", txt)) return false;
+  int a = 0, b = 0;
+  char linea[64];
+  if (sscanf(txt.c_str(), "NUEVA %d %d", &a, &b) == 2) {
+    float firma[NFIRMA];
+    calcularFirma(EI_CLASSIFIER_INPUT_WIDTH / 2.0, EI_CLASSIFIER_INPUT_HEIGHT / 2.0, firma);
+    int j = buscarPorId(a);
+    if (j < 0) j = nuevaPersona(firma, a);
+    personas[j].ultimaFoto = millis();
+    personas[j].verificada = millis();
+    evitarAqui();
+    snprintf(linea, sizeof(linea), "FOTO #%d persona %d (PC, escaneo)", b, a);
+    info(linea);
+    ultimaPersonaAvisada = a;
+    return true;
+  }
+  if (sscanf(txt.c_str(), "IR %d %d", &a, &b) == 2) {
+    float dPan  = constrain(0.8 * a * GRADOS_POR_PIXEL_CAM, -2 * PASO_MAX, 2 * PASO_MAX);
+    float dTilt = constrain(0.8 * b * GRADOS_POR_PIXEL_CAM, -2 * PASO_MAX, 2 * PASO_MAX);
+    panCmd  += INVERTIR_PAN  ? dPan  : -dPan;
+    tiltCmd += INVERTIR_TILT ? dTilt : -dTilt;
+    ciclosSinRostro = 0;
+    ultimoEscaneo = 0;
+    snprintf(linea, sizeof(linea), "PC ve un rostro sin registrar: apunto (%d, %d)", a, b);
+    info(linea);
+    return true;
+  }
+  return false;
+}
+
+// Escribe la hora de una foto como texto
 void textoHora(const Foto &f, char *buf, size_t n) {
-  if (f.hora > 1700000000) {   // hay hora real (NTP)
+  if (f.hora > 1700000000) {
     struct tm t;
     localtime_r(&f.hora, &t);
     strftime(buf, n, "%d/%m %H:%M:%S", &t);
@@ -647,6 +645,7 @@ void textoHora(const Foto &f, char *buf, size_t n) {
   }
 }
 
+// Página web con la galería de fotos
 void paginaGaleria() {
   String html =
     "<!doctype html><html><head><meta charset='utf-8'>"
@@ -675,6 +674,7 @@ void paginaGaleria() {
   servidor.send(200, "text/html", html);
 }
 
+// Envía al navegador una foto guardada
 void enviarFotoWeb() {
   int n = servidor.arg("n").toInt();
   xSemaphoreTake(candado, portMAX_DELAY);
@@ -694,6 +694,7 @@ void enviarFotoWeb() {
   arch.close();
 }
 
+// Tarea aparte que atiende la galería web
 void tareaServidor(void *) {
   for (;;) {
     servidor.handleClient();
@@ -701,25 +702,47 @@ void tareaServidor(void *) {
   }
 }
 
-void iniciarWiFi() {
-  WiFi.mode(WIFI_STA);
-  WiFi.setSleep(false);
-  WiFi.begin(WIFI_NOMBRE, WIFI_CLAVE);
-  // (14 oct) Potencia de transmisión reducida: los picos de corriente del
-  // WiFi a máxima potencia provocaban "Brownout detector was triggered"
-  // (el ESP32 se reiniciaba y perdía las fotos). A pocos metros del router
-  // alcanza con 8.5 dBm.
-  WiFi.setTxPower(WIFI_POWER_8_5dBm);
-  unsigned long t0 = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) delay(300);
-  if (WiFi.status() != WL_CONNECTED) {
-    info("WiFi no conectado: sin galeria (fotos en flash)");
-    return;
+// Busca la red WiFi y avisa si la ve, con qué señal y en qué canal
+void buscarRedWiFi() {
+  int n = WiFi.scanNetworks();
+  char linea[96];
+  for (int i = 0; i < n; i++) {
+    if (WiFi.SSID(i) == WIFI_NOMBRE) {
+      snprintf(linea, sizeof(linea), "WiFi: red vista, senal %d dBm, canal %d",
+               WiFi.RSSI(i), WiFi.channel(i));
+      info(linea);
+      WiFi.scanDelete();
+      return;
+    }
   }
+  snprintf(linea, sizeof(linea), "WiFi: NO veo la red (%d redes vistas). 5 GHz o lejos?", n);
+  info(linea);
+  WiFi.scanDelete();
+}
+
+// Traduce el estado del WiFi a palabras
+const char *motivoWiFi(wl_status_t s) {
+  switch (s) {
+    case WL_NO_SSID_AVAIL:  return "red no encontrada";
+    case WL_CONNECT_FAILED: return "fallo al conectar (clave?)";
+    case WL_CONNECTION_LOST: return "conexion perdida";
+    case WL_DISCONNECTED:   return "desconectado (clave o senal?)";
+    case WL_IDLE_STATUS:    return "esperando";
+    default:                return "otro";
+  }
+}
+
+// Al conectarse al WiFi: pone la hora e inicia la galería web
+void activarServiciosWiFi() {
   hayWiFi = true;
-  configTime(-5 * 3600, 0, "pool.ntp.org", "time.google.com");   // hora de Perú (UTC-5)
+  configTime(-5 * 3600, 0, "pool.ntp.org", "time.google.com");
   servidor.on("/", paginaGaleria);
   servidor.on("/f", enviarFotoWeb);
+  servidor.on("/estado", []() {
+    char t[64];
+    snprintf(t, sizeof(t), "%s %lu", pasoGuardado, millis() - inicioCiclo);
+    servidor.send(200, "text/plain", t);
+  });
   servidor.begin();
   xTaskCreatePinnedToCore(tareaServidor, "web", 8192, nullptr, 1, nullptr, 0);
   char linea[64];
@@ -727,12 +750,58 @@ void iniciarWiFi() {
   info(linea);
 }
 
-// ===================================================================
+#define WIFI_REINTENTO_MS 30000UL             // cada cuánto se reintenta el WiFi
+unsigned long ultimoIntentoWiFi = 0;          // momento del último intento
+// Si no hay WiFi, lo reintenta cada 30 s y activa la galería cuando conecta
+void revisarWiFi() {
+  if (hayWiFi) return;
+  if (WiFi.status() == WL_CONNECTED) {
+    info("WiFi conectado (reintento)");
+    activarServiciosWiFi();
+    return;
+  }
+  if (millis() - ultimoIntentoWiFi < WIFI_REINTENTO_MS) return;
+  ultimoIntentoWiFi = millis();
+  char linea[80];
+  snprintf(linea, sizeof(linea), "WiFi: reintento (%s)", motivoWiFi(WiFi.status()));
+  info(linea);
+  WiFi.disconnect();
+  WiFi.begin(WIFI_NOMBRE, WIFI_CLAVE);
+}
+
+// Se conecta al WiFi al arrancar (espera hasta 15 s)
+void iniciarWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  buscarRedWiFi();
+  WiFi.begin(WIFI_NOMBRE, WIFI_CLAVE);
+  WiFi.setTxPower(WIFI_POWER_13dBm);
+  unsigned long t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) delay(300);
+  if (WiFi.status() != WL_CONNECTED) {
+    char linea[96];
+    snprintf(linea, sizeof(linea), "WiFi no conectado (%s): reintento cada 30 s",
+             motivoWiFi(WiFi.status()));
+    info(linea);
+    ultimoIntentoWiFi = millis();
+    return;
+  }
+  activarServiciosWiFi();
+}
+
+// Reinicia el ESP32 si un ciclo se queda trabado más de VIGILANTE_S segundos
+void tareaVigilante(void *) {
+  for (;;) {
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    if (inicioCiclo && millis() - inicioCiclo > VIGILANTE_S * 1000UL) {
+      marcaVigilante = MARCA_VIGILANTE;
+      esp_restart();
+    }
+  }
+}
+
+// Inicia la memoria, la cámara, la flash, el WiFi y el vigilante
 void setup() {
-  // (14 oct) Detector de "brownout" desactivado: con el cargador compartido
-  // con los servos, las caídas breves de voltaje reiniciaban el ESP32.
-  // Lo ideal igual es un capacitor de 470-1000 µF en 5V/GND o un cargador
-  // aparte para el ESP32.
   WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
   Serial.begin(115200);
   enlace.begin(9600, SERIAL_8N1, PIN_RX_ARDUINO, PIN_TX_ARDUINO);
@@ -754,49 +823,65 @@ void setup() {
   }
   iniciarFlash();
   iniciarWiFi();
+
+  bool porVigilante = (marcaVigilante == MARCA_VIGILANTE);
+  marcaVigilante = 0;
+  xTaskCreatePinnedToCore(tareaVigilante, "vigilante", 2048, nullptr, 2, nullptr, 0);
+  if (porVigilante) {
+    char l[64];
+    snprintf(l, sizeof(l), "REINICIO por vigilante: trabado en '%s'", pasoGuardado);
+    info(l);
+  }
   info("VigIA listo: buscando rostros");
   enviarPosicion();
 }
 
+// Ciclo principal: foto, IA, elegir rostro nuevo, centrarlo / fotografiarlo o buscar, y mover los servos
 void loop() {
+  inicioCiclo = millis();
+  revisarWiFi();
   if (!capturar()) { info("ERROR captura"); delay(500); return; }
 
   ei::signal_t senal;
   senal.total_length = EI_CLASSIFIER_INPUT_WIDTH * EI_CLASSIFIER_INPUT_HEIGHT;
   senal.get_data = &obtenerDatos;
   ei_impulse_result_t res = { 0 };
+  paso("IA");
   if (run_classifier(&senal, &res, false) != EI_IMPULSE_OK) {
     info("ERROR al ejecutar el modelo");
     return;
   }
 
-  // ---- Clasificar los rostros: NUEVOS o YA REGISTRADOS ----
-  // La cámara no "sigue" a nadie: busca rostros NUEVOS, los fotografía una
-  // vez y a los ya registrados (hace < 5 min) los ignora y sigue buscando.
+  paso("firmas");
+
   float mejorConf = 0;
   for (uint32_t i = 0; i < res.bounding_boxes_count; i++) {
-    if (res.bounding_boxes[i].value > mejorConf) mejorConf = res.bounding_boxes[i].value;
+    ei_impulse_result_bounding_box_t &b = res.bounding_boxes[i];
+    if (enLugarEvitado(b.x + b.width / 2.0, b.y + b.height / 2.0)) continue;
+    if (b.value > mejorConf) mejorConf = b.value;
   }
   float refX = (ultimoX < 0) ? EI_CLASSIFIER_INPUT_WIDTH / 2.0 : ultimoX;
   float refY = (ultimoY < 0) ? EI_CLASSIFIER_INPUT_HEIGHT / 2.0 : ultimoY;
-  int rostros = 0, nuevos = 0, elegido = -1, ignorada = -1;
+  int rostros = 0, nuevos = 0, elegido = -1, ignorada = -1, evitados = 0;
   float mejorDist = 1e9, simCiclo = 0;
   for (uint32_t i = 0; i < res.bounding_boxes_count; i++) {
     ei_impulse_result_bounding_box_t &b = res.bounding_boxes[i];
     if (b.value < UMBRAL) continue;
     rostros++;
-    if (b.value < mejorConf - MARGEN_CONF) continue;
     float cx = b.x + b.width / 2.0, cy = b.y + b.height / 2.0;
+    if (enLugarEvitado(cx, cy)) { evitados++; continue; }
+    if (b.value < mejorConf - MARGEN_CONF) continue;
     float firma[NFIRMA], sim = 0;
     calcularFirma(cx, cy, firma);
-    // De lejos solo se ignora si la coincidencia es MUY alta; si hay duda
-    // se trata como "posible nuevo" y la cámara se acerca a verlo
+
     int p = buscarPersona(firma, UMBRAL_IGNORAR, &sim);
     if (sim > simCiclo) simCiclo = sim;
-    if (p >= 0) { ignorada = p; continue; }        // ya registrada: se ignora
+
+    bool pcDisponible = strlen(PC_IP) > 0 && hayWiFi && !pcCaida;
+    if (p >= 0 && pcDisponible && millis() - personas[p].verificada > VERIF_MS) p = -1;
+    if (p >= 0) { ignorada = p; continue; }
     nuevos++;
-    // Entre los nuevos, el más cercano al que se venía centrando (para
-    // terminar con uno antes de pasar al siguiente)
+
     float d = (cx - refX) * (cx - refX) + (cy - refY) * (cy - refY);
     if (d < mejorDist) { mejorDist = d; elegido = i; }
   }
@@ -814,14 +899,15 @@ void loop() {
   }
   info(linea);
 
-  if (elegido >= 0) {
-    // ---- HAY UN ROSTRO NUEVO: centrarlo y fotografiarlo ----
+  if (elegido < 0 && escanearConPC()) {
+
+  } else if (elegido >= 0) {
     ciclosSinRostro = 0;
     ei_impulse_result_bounding_box_t &b = res.bounding_boxes[elegido];
     float cx = b.x + b.width / 2.0, cy = b.y + b.height / 2.0;
     ultimoX = cx; ultimoY = cy;
 
-    registrar(cx, cy, b.value);   // foto si está centrado y es alguien nuevo
+    registrar(cx, cy, b.value);
 
     float errX = cx - EI_CLASSIFIER_INPUT_WIDTH / 2.0;
     float errY = cy - EI_CLASSIFIER_INPUT_HEIGHT / 2.0;
@@ -835,19 +921,17 @@ void loop() {
     }
     vistoX = cx;
     panVisto = panCmd;
-  } else if (ignorada >= 0) {
-    // ---- SOLO HAY PERSONAS YA REGISTRADAS: ignorarlas y seguir buscando ----
-    avisarIgnorada(ignorada);
+  } else if (ignorada >= 0 || evitados > 0) {
+    if (ignorada >= 0) avisarIgnorada(ignorada);
     ultimoX = ultimoY = -1;
     centradoSeguidas = 0;
     vistoX = -1;
-    ciclosSinRostro = ESPERA_QUIETO + 3;   // si luego no ve a nadie, sigue el barrido sin esperar
+    ciclosSinRostro = ESPERA_QUIETO + 3;
     panCmd += sentidoBusqueda * BUSQ_PASO;
     if (panCmd >= BUSQ_PAN_MAX) { panCmd = BUSQ_PAN_MAX; sentidoBusqueda = -1; }
     if (panCmd <= BUSQ_PAN_MIN) { panCmd = BUSQ_PAN_MIN; sentidoBusqueda = 1; }
     tiltCmd += (TILT_CENTRO - tiltCmd) * 0.3;
   } else {
-    // ---- NO HAY NADIE ----
     ciclosSinRostro++;
     ultimoX = ultimoY = -1;
     centradoSeguidas = 0;
@@ -855,7 +939,7 @@ void loop() {
     int haciaDerechaImagen = INVERTIR_PAN ? 1 : -1;
 
     if (ciclosSinRostro <= ESPERA_QUIETO) {
-      // quieto: probablemente sigue ahí
+
     } else if (ciclosSinRostro == ESPERA_QUIETO + 1) {
       if (vistoX >= 0 && vistoX > EI_CLASSIFIER_INPUT_WIDTH - BORDE_PX) {
         sentidoBusqueda = haciaDerechaImagen;

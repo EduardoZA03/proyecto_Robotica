@@ -3,6 +3,8 @@
 > Este archivo lo lee Claude Code al abrir el proyecto. Resume TODO lo que
 > se hizo y los errores que ya se resolvieron, para no repetirlos.
 
+> **¿PC nueva?** Seguir `INSTALAR.md` (placas, librerías, Python, secretos.h).
+
 ## Reglas para Claude
 - **Responder SIEMPRE en español** (el usuario lo pidió muchas veces; incluso
   avisos cortos y mensajes tras tareas en segundo plano).
@@ -10,7 +12,10 @@
 - Antes de editar mucho, **confirmar que se entendió lo que quiere** (el usuario
   prefiere conversar primero cuando cambia la idea).
 - Nunca escribir ni repetir la clave del WiFi (`secretos.h`, lo llena el usuario).
-- Código muy comentado, en español, con sección de "errores comunes".
+- Comentarios en español y MÍNIMOS (pedido del 12 nov): una línea por función
+  (qué hace) y una por variable/constante (qué es). Nada más: sin historia de
+  cambios, sin "errores comunes", sin explicaciones dentro de las funciones.
+  Lo que se aprenda va en este CLAUDE.md, no en el código.
 - Compilar SIEMPRE con arduino-cli antes de pedir que suba; avanzar por pasos.
 
 ## Qué es VigIA
@@ -36,7 +41,7 @@ identifica a nadie / sin biometría": hay que reescribir esa parte.
 | HC-SR04 | Se quitó del proyecto |
 
 ### Modo USO (funcionando)
-- ESP32 **IO13 → pin 2** del Uno (órdenes "P95 T88", 9600 baud, solo TX).
+- ESP32 **IO13 → pin 4** del Uno (órdenes "P95 T88", 9600 baud, solo TX; SoftwareSerial RX=4).
 - ESP32 5V → **+ del cargador** (no del 5V del Uno: con WiFi da brownout).
 - **Todos los GND unidos** (ESP32, Uno, cargador, servos).
 - Uno: **sin** puente RESET→GND y **sin** cables en pines 0/1.
@@ -153,7 +158,20 @@ identifica a nadie / sin biometría": hay que reescribir esa parte.
   Decisión del 14 oct: **NO entrenar la IA en Python** (Edge Impulse da lo mismo); Python solo
   para medir y ajustar. Muestra: nombres genéricos, con permiso, borrar fotos al terminar.
 
-## Estado actual (14 oct 2026)
+## Estado actual (12 nov 2026) — FUNCIONA COMPLETO
+- 07 subido y funcionando en modo uso: WiFi con diagnóstico y reintento cada 30 s
+  (`revisarWiFi`), `enTope()` evita que la cámara se quede trabada en el tope del pan.
+- La PC (servidor_vigia.py) registra personas NUEVA/CONOCIDA; fotos en `fotos\`,
+  sin rostro en `descartadas\`, decisiones en `fotos\registro.csv`.
+- Arduino Uno abierto por serie con DTR resetea y entra en modo demo: usar DtrEnable=$false
+  o enviar "C" para centrar/detener.
+- `informe\`: informe corregido (docx/pdf), PPT, guía de exposición, explicación del código.
+- `proteus\VigIA_servos.pdsprj`: simulación del Uno + 2 servos (pines 9/10) con terminal
+  virtual en el pin 4 que hace de ESP32 (probado: "P140 T40" mueve los servos).
+- Pendiente: script de estadística descriptiva (`analizar_resultados.py`) que el informe
+  menciona pero no existe todavía; necesita anotar a mano quién pasó en cada prueba.
+
+## Estado anterior (14 oct 2026)
 - **Cargado en el ESP32**: versión 07 con fotos en PSRAM, WiFi a 8.5 dBm y opción A.
   Funciona (tomó fotos de 2 personas e ignoró a la ya registrada), PERO se
   reinicia cada 1–2 min por **brownout** y pierde las fotos.

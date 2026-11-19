@@ -9,9 +9,9 @@ dataset/_cache/
 dataset/muestra/
 dataset/muestra_revisar/
 
-# Servidor de la PC: fotos de personas y modelos (se descargan solos, ~39 MB)
+# Servidor de la PC: fotos de personas (datos biométricos)
 pc_servidor/fotos/
-pc_servidor/modelos/
+# pc_servidor/modelos/ (ahora se suben, para no depender de internet)
 __pycache__/
 
 # Respaldos y carpetas de compilación

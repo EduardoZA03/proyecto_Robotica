@@ -3,6 +3,18 @@
 > Claude: sigue estos pasos en orden y verifica cada uno. Responde al usuario en español.
 > No escribas ni pidas en el chat la clave del WiFi: el usuario la escribe en `secretos.h`.
 
+## 0. Forma rápida (recomendada)
+1. Instalar **Arduino IDE 2.x**, **Python 3** (marcar "Add python.exe to PATH") y **Git**.
+2. En la carpeta del repositorio: clic derecho en `instalar.ps1` → **Ejecutar con PowerShell**
+   (o `powershell -ExecutionPolicy Bypass -File instalar.ps1`).
+   Instala placas AVR y ESP32 3.3.12, librería Servo, librería de la IA, librerías de Python
+   y crea `07_vigia_completo\secretos.h` desde la plantilla. Al final muestra un resumen.
+3. El usuario llena `secretos.h` (WiFi y `PC_IP`).
+4. Si el Arduino no aparece en `arduino-cli board list`: abrir "Install drivers for Arduino"
+   (viene con el IDE) o instalar el driver CH340 si la placa es un clon.
+
+Los pasos 1–5 de abajo son lo mismo, hecho a mano (para revisar si algo falla).
+
 ## 1. Programas necesarios
 | Programa | Para qué | Cómo comprobar |
 |---|---|---|
@@ -36,7 +48,7 @@ El usuario escribe el nombre exacto del WiFi (2.4 GHz, respetando mayúsculas) y
 ```powershell
 cd pc_servidor
 python -m pip install -r requirements.txt
-python servidor_vigia.py --probar prueba.jpg   # solo para verificar que carga (descarga los modelos la 1.ª vez, ~39 MB)
+python servidor_vigia.py --probar prueba.jpg   # solo para verificar que carga los modelos (ya vienen en pc_servidor\modelos)
 python servidor_vigia.py                        # o doble clic en iniciar_servidor.bat
 ```
 - La 1.ª vez Windows pregunta por el firewall: permitir Python en redes **privadas**.
@@ -46,8 +58,8 @@ python servidor_vigia.py                        # o doble clic en iniciar_servid
 ## 5. Compilar y subir
 Arduino Uno (COM que aparezca en `arduino-cli board list`):
 ```powershell
-& $cli compile --fqbn arduino:avr:uno 03_arduino_servos
-& $cli upload -p COMx --fqbn arduino:avr:uno 03_arduino_servos
+& $cli compile --fqbn arduino:avr:uno --build-path C:\vigia_b03 03_arduino_servos
+& $cli upload -p COMx --fqbn arduino:avr:uno --input-dir C:\vigia_b03 03_arduino_servos
 ```
 ESP32-CAM (se sube a través del Uno en modo programador, ver CLAUDE.md). Compilar tarda ~15 min.
 Usar una ruta de compilación corta (rutas largas fallan en Windows):
@@ -60,5 +72,4 @@ Subida correcta = 4 veces "Hash of data verified" + "Hard resetting".
 ## 6. Qué NO está en GitHub (a propósito)
 - `secretos.h` (clave del WiFi).
 - `pc_servidor\fotos\`, `pc_servidor\descartadas\`, `personas.json`: fotos y huellas faciales (datos biométricos).
-- `pc_servidor\modelos\`: YuNet y SFace se descargan solos al arrancar el servidor.
 - Imágenes de `dataset\`.

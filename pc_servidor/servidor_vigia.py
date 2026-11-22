@@ -417,6 +417,21 @@ def probar(archivos):
         print(f"{ruta.name}: {texto_respuesta(r):<16} | {texto_consola(r)}")
 
 
+# Desactiva el modo "Seleccionar" de la consola de Windows (un clic congelaba el servidor)
+def sin_seleccion_consola():
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        k = ctypes.windll.kernel32
+        h = k.GetStdHandle(-10)
+        modo = ctypes.c_uint32()
+        if k.GetConsoleMode(h, ctypes.byref(modo)):
+            k.SetConsoleMode(h, (modo.value | 0x80) & ~0x40)
+    except Exception:
+        pass
+
+
 # Lee los argumentos e inicia el servidor (o el modo --probar)
 def main():
     global reconocedor
@@ -428,6 +443,7 @@ def main():
     if args.probar:
         return probar(args.probar)
 
+    sin_seleccion_consola()
     reconocedor = Reconocedor(guardar=True)
     ip = ip_local()
     print("=== VigIA - servidor de reconocimiento (PC) ===")

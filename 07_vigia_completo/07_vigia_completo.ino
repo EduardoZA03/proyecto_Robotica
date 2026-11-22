@@ -68,7 +68,7 @@ HardwareSerial enlace(2);                     // puerto serie hacia el Arduino U
 
 #define INVERTIR_PAN   true                   // invierte el sentido del pan (cámara de cabeza)
 #define INVERTIR_TILT  true                   // invierte el sentido del tilt
-#define GANANCIA       0.65                   // fracción del error que se corrige en cada paso
+#define GANANCIA       0.40                   // fracción del error que se corrige en cada paso
 #define MARGEN_CONF    0.15                   // diferencia de confianza aceptada respecto al mejor rostro
 #define ZONA_MUERTA    4                      // error (píxeles) que se considera centrado
 #define PASO_MAX       15                     // máximo de grados por corrección
@@ -95,6 +95,8 @@ HardwareSerial enlace(2);                     // puerto serie hacia el Arduino U
 #define VENTANA_MS     (2UL * 60UL * 1000UL)  // tiempo que se ignora a una persona ya fotografiada
 #define CENTRADO_PX    8                      // error máximo (píxeles) para tomar la foto
 #define CONFIRMACIONES 2                      // ciclos centrado seguidos antes de la foto
+#define MAX_SEGUIR     6                      // ciclos siguiendo un rostro sin centrarlo antes de aceptarlo
+#define CENTRADO_MAX_PX 24                    // error (píxeles) aceptado cuando se agota MAX_SEGUIR
 #define ESPERA_INICIO_MS 3000                 // espera al arrancar antes de tomar fotos
 #define CONF_FOTO      0.60                   // confianza mínima para tomar la foto
 
@@ -137,6 +139,7 @@ Persona personas[MAX_PERSONAS];               // personas recordadas
 int siguienteIdPersona = 1;                   // número para la próxima persona nueva
 int ultimaPersonaAvisada = -1;                // última persona anunciada (evita repetir avisos)
 int centradoSeguidas = 0;                     // ciclos seguidos con el rostro centrado
+int ciclosSiguiendo = 0;                      // ciclos seguidos siguiendo un rostro sin registrarlo
 
 struct Foto {
   bool usada;                                 // true = la casilla tiene foto
@@ -491,15 +494,16 @@ int preguntarPC(int &persona, int &dato) {
   return PC_FALLA;
 }
 
-// Marca la posición actual como lugar a evitar por un tiempo
-void evitarAqui() {
+// Marca la posición actual como lugar a evitar durante 'duracion' ms
+void evitarAqui(unsigned long duracion) {
   int k = 0;
   for (int i = 0; i < EVITAR_N; i++)
     if (evitarHasta[i] < evitarHasta[k]) k = i;
   evitarPan[k] = panCmd;
   evitarTilt[k] = tiltCmd;
-  evitarHasta[k] = millis() + VERIF_MS;
+  evitarHasta[k] = millis() + duracion;
   ultimoX = ultimoY = -1;
+  ciclosSiguiendo = 0;
 }
 
 // Devuelve true si un rostro está en un lugar que se debe evitar
@@ -526,7 +530,8 @@ void registrar(float cx, float cy, float conf) {
   if (enTope(errX, panCmd, PAN_MIN, PAN_MAX, INVERTIR_PAN)) errX = 0;
   if (enTope(errY, tiltCmd, TILT_MIN, TILT_MAX, INVERTIR_TILT)) errY = 0;
   if (millis() < ESPERA_INICIO_MS) return;
-  if (fabs(errX) > CENTRADO_PX || fabs(errY) > CENTRADO_PX || conf < CONF_FOTO) {
+  float tolerancia = (ciclosSiguiendo >= MAX_SEGUIR) ? CENTRADO_MAX_PX : CENTRADO_PX;
+  if (fabs(errX) > tolerancia || fabs(errY) > tolerancia || conf < CONF_FOTO) {
     centradoSeguidas = 0;
     return;
   }
@@ -552,7 +557,7 @@ void registrar(float cx, float cy, float conf) {
     unsigned long hace = (resp == PC_CONOCIDA) ? (unsigned long)dato * 1000UL : 0;
     personas[j].ultimaFoto = millis() - min(hace, millis());
     personas[j].verificada = millis();
-    evitarAqui();
+    evitarAqui(VERIF_MS);
 
     if (resp == PC_NUEVA) {
       snprintf(linea, sizeof(linea), "FOTO #%d persona %d (PC)", dato, idPC);
@@ -569,7 +574,7 @@ void registrar(float cx, float cy, float conf) {
   }
   if (resp == PC_SIN_ROSTRO) {
     nuevaPersona(firma, ID_SIN_ROSTRO);
-    evitarAqui();
+    evitarAqui(VERIF_MS);
     if (ultimaPersonaAvisada != ID_SIN_ROSTRO) info("no era un rostro (dice la PC): lo ignoro");
     ultimaPersonaAvisada = ID_SIN_ROSTRO;
     return;
@@ -582,10 +587,12 @@ void registrar(float cx, float cy, float conf) {
     for (int k = 0; k < NFIRMA; k++)
       personas[i].firma[k] = 0.6 * personas[i].firma[k] + 0.4 * firma[k];
     avisarIgnorada(i);
+    evitarAqui(VENTANA_MS);
     return;
   }
 
   int n = nuevaPersona(firma, siguienteIdPersona);
+  evitarAqui(VENTANA_MS);
   if (guardarFoto(personas[n].id)) {
     snprintf(linea, sizeof(linea), "FOTO #%d persona %d (nueva, s%d)", totalFotos, personas[n].id,
              (int)(sim * 100));
@@ -614,7 +621,7 @@ bool escanearConPC() {
     if (j < 0) j = nuevaPersona(firma, a);
     personas[j].ultimaFoto = millis();
     personas[j].verificada = millis();
-    evitarAqui();
+    evitarAqui(VERIF_MS);
     snprintf(linea, sizeof(linea), "FOTO #%d persona %d (PC, escaneo)", b, a);
     info(linea);
     ultimaPersonaAvisada = a;
@@ -906,6 +913,7 @@ void loop() {
     ei_impulse_result_bounding_box_t &b = res.bounding_boxes[elegido];
     float cx = b.x + b.width / 2.0, cy = b.y + b.height / 2.0;
     ultimoX = cx; ultimoY = cy;
+    ciclosSiguiendo++;
 
     registrar(cx, cy, b.value);
 
@@ -925,6 +933,7 @@ void loop() {
     if (ignorada >= 0) avisarIgnorada(ignorada);
     ultimoX = ultimoY = -1;
     centradoSeguidas = 0;
+    ciclosSiguiendo = 0;
     vistoX = -1;
     ciclosSinRostro = ESPERA_QUIETO + 3;
     panCmd += sentidoBusqueda * BUSQ_PASO;
@@ -935,6 +944,7 @@ void loop() {
     ciclosSinRostro++;
     ultimoX = ultimoY = -1;
     centradoSeguidas = 0;
+    ciclosSiguiendo = 0;
     if (ciclosSinRostro >= CICLOS_FIN_SEGUIMIENTO) ultimaPersonaAvisada = -1;
     int haciaDerechaImagen = INVERTIR_PAN ? 1 : -1;
 

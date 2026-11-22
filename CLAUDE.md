@@ -168,8 +168,10 @@ identifica a nadie / sin biometría": hay que reescribir esa parte.
 - `informe\`: informe corregido (docx/pdf), PPT, guía de exposición, explicación del código.
 - `proteus\VigIA_servos.pdsprj`: simulación del Uno + 2 servos (pines 9/10) con terminal
   virtual en el pin 4 que hace de ESP32 (probado: "P140 T40" mueve los servos).
-- Pendiente: script de estadística descriptiva (`analizar_resultados.py`) que el informe
-  menciona pero no existe todavía; necesita anotar a mano quién pasó en cada prueba.
+- `pruebas\`: ficha_pruebas.xlsx (anotar los 10 ensayos), ficha_imprimible.pdf y
+  analizar_resultados.py (estadística descriptiva + gráficos). Pendiente: HACER los ensayos
+  reales y con esos datos redactar Resultados, Discusión y Conclusiones del informe.
+  NUNCA inventar resultados.
 
 ## Estado anterior (14 oct 2026)
 - **Cargado en el ESP32**: versión 07 con fotos en PSRAM, WiFi a 8.5 dBm y opción A.

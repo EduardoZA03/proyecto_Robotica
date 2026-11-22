@@ -58,6 +58,8 @@ if (-not $py) {
     python --version
     python -m pip install -r (Join-Path $aqui "pc_servidor\requirements.txt")
     if ($LASTEXITCODE -ne 0) { $problemas += "Falló pip install" }
+    python -m pip install -r (Join-Path $aqui "pruebas\requirements.txt")
+    if ($LASTEXITCODE -ne 0) { $problemas += "Falló pip install (pruebas)" }
     Push-Location (Join-Path $aqui "pc_servidor")
     python servidor_vigia.py --probar no_existe.jpg
     Pop-Location

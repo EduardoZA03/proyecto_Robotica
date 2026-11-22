@@ -55,6 +55,13 @@ python servidor_vigia.py                        # o doble clic en iniciar_servid
 - El perfil de la red (Configuración → Red) debe ser **Privada**; si es Pública, el ESP32 no llega a la PC.
   Ese cambio lo hace el usuario, no Claude.
 
+## 4b. Análisis de las pruebas
+```powershell
+python -m pip install -r pruebas\requirements.txt
+python pruebas\analizar_resultados.py   # lee pruebas\ficha_pruebas.xlsx y pc_servidor\fotos\registro.csv
+```
+Genera `pruebas\resultados\resultados.md` (tablas con fórmulas) y gráficos PNG.
+
 ## 5. Compilar y subir
 Arduino Uno (COM que aparezca en `arduino-cli board list`):
 ```powershell

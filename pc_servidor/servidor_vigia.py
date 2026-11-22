@@ -22,7 +22,7 @@ except ImportError:
     sys.exit('Falta OpenCV. Instalar con:  pip install "opencv-python<5" numpy')
 
 PUERTO = 8000                 # puerto del servidor web
-VENTANA_S = 5 * 60            # segundos que se ignora a una persona ya fotografiada
+VENTANA_S = 2 * 60            # segundos que se ignora a una persona ya fotografiada
 UMBRAL_COSENO = 0.363         # similitud mínima para decir "misma persona"
 CONF_DETECCION = 0.6          # confianza mínima de YuNet para aceptar un rostro
 MAX_VISTAS = 6                # huellas guardadas por persona

@@ -92,7 +92,7 @@ HardwareSerial enlace(2);                     // puerto serie hacia el Arduino U
 #define BUSQ_PAN_MAX  155
 #define BUSQ_PASO      25                     // grados por paso de búsqueda
 
-#define VENTANA_MS     (5UL * 60UL * 1000UL)  // tiempo que se ignora a una persona ya fotografiada
+#define VENTANA_MS     (2UL * 60UL * 1000UL)  // tiempo que se ignora a una persona ya fotografiada
 #define CENTRADO_PX    8                      // error máximo (píxeles) para tomar la foto
 #define CONFIRMACIONES 2                      // ciclos centrado seguidos antes de la foto
 #define ESPERA_INICIO_MS 3000                 // espera al arrancar antes de tomar fotos
@@ -315,7 +315,7 @@ float similitud(const float *a, const float *b) {
   return s;
 }
 
-// Busca la persona recordada más parecida; olvida a las que pasaron los 5 minutos
+// Busca la persona recordada más parecida; olvida a las que pasaron los 2 minutos
 int buscarPersona(const float *firma, float umbral, float *simMax) {
   int mejor = -1;
   float mejorSim = 0;

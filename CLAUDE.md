@@ -158,7 +158,20 @@ identifica a nadie / sin biometría": hay que reescribir esa parte.
   Decisión del 14 oct: **NO entrenar la IA en Python** (Edge Impulse da lo mismo); Python solo
   para medir y ajustar. Muestra: nombres genéricos, con permiso, borrar fotos al terminar.
 
-## Estado actual (12 nov 2026) — FUNCIONA COMPLETO
+## Cambios del 22 nov 2026 (video de prueba)
+- Ventana de registro **2 minutos** (antes 5) en `VENTANA_S` (PC) y `VENTANA_MS` (ESP32).
+  Para volver a 5 min cambiar ambos y recompilar/subir el 07.
+- PC con IP **192.168.15.7** (cambió por DHCP); `PC_IP` en secretos.h actualizado. ESP32 en .27.
+- Oscilación frente a un rostro (x28↔x68, nunca centraba): `GANANCIA` 0.65 → **0.40**,
+  `MAX_SEGUIR 6` + `CENTRADO_MAX_PX 24` (acepta "casi centrado"), y sin PC ahora llama a
+  `evitarAqui(VENTANA_MS)` tras la foto para seguir buscando. `evitarAqui(duracion)` recibe ms.
+- **Consola del servidor se congelaba** al hacer clic (modo Seleccionar de Windows): el servidor
+  guardaba la foto pero no respondía → el ESP32 caía a firma de color. `sin_seleccion_consola()`
+  lo desactiva al arrancar.
+- Informe final: `informe/Robotica-VigIA-FINAL.docx/.pdf` (fuentes verificadas en internet;
+  se quitaron 3 referencias inexistentes y se rehicieron los 5 antecedentes con trabajos reales).
+
+## Estado (12 nov 2026) — FUNCIONA COMPLETO
 - 07 subido y funcionando en modo uso: WiFi con diagnóstico y reintento cada 30 s
   (`revisarWiFi`), `enTope()` evita que la cámara se quede trabada en el tope del pan.
 - La PC (servidor_vigia.py) registra personas NUEVA/CONOCIDA; fotos en `fotos\`,
